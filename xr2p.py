@@ -8,8 +8,10 @@ numeric R programs like the early xr2f.py test cases, not general R.
 from __future__ import annotations
 
 import argparse
+import ast
 import importlib.util
 import keyword
+import math
 import re
 import subprocess
 import sys
@@ -72,6 +74,82 @@ def translate_source(source: str) -> str:
 
 def add_runtime_helpers(python: str) -> str:
     helpers: list[str] = []
+    if "r_length(" in python:
+        helpers.append(
+            """
+def r_length(x):
+    if "RNamedVector" in globals() and isinstance(x, RNamedVector):
+        return len(x.values)
+    if isinstance(x, np.ndarray):
+        return x.size
+    try:
+        return len(x)
+    except TypeError:
+        return 1
+""".strip()
+        )
+    if "r_c(" in python or "r_names(" in python:
+        helpers.append(
+            """
+class RNamedVector:
+    def __init__(self, values, names):
+        self.values = np.asarray(values)
+        self.names = list(names)
+
+    def __array__(self, dtype=None):
+        return np.asarray(self.values, dtype=dtype)
+
+    def __len__(self):
+        return len(self.values)
+
+    def __iter__(self):
+        return iter(self.values)
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return self.values[self.names.index(key)]
+        if isinstance(key, RNamedVector):
+            key = key.values
+        arr = np.asarray(key)
+        if arr.dtype.kind in {"U", "S", "O"}:
+            idx = [self.names.index(str(item)) for item in arr]
+            return RNamedVector(self.values[idx], [self.names[i] for i in idx])
+        return self.values[key]
+
+    def __setitem__(self, key, value):
+        if isinstance(key, str):
+            self.values[self.names.index(key)] = value
+            return
+        self.values[key] = value
+
+
+def r_c(*values, names=None):
+    flat_values = []
+    flat_names = []
+    any_names = names is not None
+    given_names = list(names) if names is not None else [None] * len(values)
+    for value, name in zip(values, given_names):
+        if isinstance(value, RNamedVector):
+            arr = np.ravel(value.values)
+            flat_values.extend(arr)
+            flat_names.extend(value.names)
+            any_names = True
+        else:
+            arr = np.ravel(value)
+            flat_values.extend(arr)
+            flat_names.extend([name] * len(arr))
+            any_names = any_names or name is not None
+    if any_names:
+        return RNamedVector(np.array(flat_values), ["" if name is None else str(name) for name in flat_names])
+    return np.array(flat_values)
+
+
+def r_names(x):
+    if "RNamedVector" in globals() and isinstance(x, RNamedVector):
+        return np.array(x.names)
+    return None
+""".strip()
+        )
     if "def varma_resid(" in python:
         helpers.append(
             """
@@ -128,7 +206,13 @@ def r_print(*args, digits=None, colnames=None):
         print(*args)
         return
     x = args[0]
-    if isinstance(x, np.ndarray):
+    if "RNamedVector" in globals() and isinstance(x, RNamedVector):
+        labels = [str(label) for label in x.names]
+        values = [r_format(v, digits) for v in x.values]
+        widths = [max(len(label), len(value)) for label, value in zip(labels, values)]
+        print(" ".join(label.rjust(widths[i]) for i, label in enumerate(labels)))
+        print(" ".join(value.rjust(widths[i]) for i, value in enumerate(values)))
+    elif isinstance(x, np.ndarray):
         if x.ndim == 0:
             print(r_format(x.item(), digits))
         elif x.ndim == 1:
@@ -165,6 +249,45 @@ def r_range(start, stop):
     stop = int(stop)
     step = 1 if stop >= start else -1
     return range(start, stop + step, step)
+""".strip()
+        )
+    if "r_add(" in python or "r_sub(" in python or "r_mul(" in python or "r_div(" in python:
+        helpers.append(
+            """
+def r_recycle_binary(x, y, op):
+    x = np.asarray(x)
+    y = np.asarray(y)
+    if x.ndim == 0 or y.ndim == 0:
+        return _RRECYCLE_OPS[op](x, y)
+    if x.ndim == 1 and y.ndim == 1 and x.shape[0] != y.shape[0]:
+        n = max(x.shape[0], y.shape[0])
+        x = np.resize(x, n)
+        y = np.resize(y, n)
+    return _RRECYCLE_OPS[op](x, y)
+
+
+def r_add(x, y):
+    return r_recycle_binary(x, y, "add")
+
+
+def r_sub(x, y):
+    return r_recycle_binary(x, y, "sub")
+
+
+def r_mul(x, y):
+    return r_recycle_binary(x, y, "mul")
+
+
+def r_div(x, y):
+    return r_recycle_binary(x, y, "div")
+
+
+_RRECYCLE_OPS = {
+    "add": np.add,
+    "sub": np.subtract,
+    "mul": np.multiply,
+    "div": np.divide,
+}
 """.strip()
         )
     if "sweep_py(" in python:
@@ -465,8 +588,14 @@ def translate_statement(line: str) -> list[str]:
     if while_match:
         return [f"while {translate_expr(while_match.group(1))}:"]
 
+    if line == "repeat":
+        return ["while True:"]
+
     if line == "break":
         return ["break"]
+
+    if line == "next":
+        return ["continue"]
 
     metadata = translate_metadata_assignment(line)
     if metadata is not None:
@@ -702,6 +831,8 @@ def translate_expr(expr: str) -> str:
     expr, strings = mask_string_literals(expr)
     expr = translate_expr_code(expr)
     expr = restore_string_literals(expr, strings)
+    for i, text in enumerate(strings):
+        expr = expr.replace(f"__R_ATTR_{i}__", r_name(text[1:-1]))
     return expr
 
 
@@ -722,8 +853,34 @@ def translate_expr_code(expr: str) -> str:
     expr = replace_matrix_vector_recycling(expr)
     expr = replace_named_matrix_columns(expr)
     expr = replace_names(expr)
+    expr = apply_recycled_binops(expr)
     expr = expr.replace("@@MEM@@", ".")
     return expr
+
+
+def strip_outer_parens(text: str) -> str:
+    text = text.strip()
+    changed = True
+    while changed and text.startswith("(") and text.endswith(")"):
+        depth = 0
+        changed = False
+        for i, ch in enumerate(text):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth < 0:
+                    return text
+                if depth == 0:
+                    if i != len(text) - 1:
+                        return text
+                    text = text[1:-1].strip()
+                    changed = True
+                    break
+        if depth != 0:
+            # Unbalanced parentheses; keep as-is to avoid over-stripping.
+            return text
+    return text
 
 
 def replace_r_constants(expr: str) -> str:
@@ -851,9 +1008,20 @@ def replace_innermost_call(expr: str) -> str:
 
 def replace_r_subscripts(expr: str) -> str:
     item_pattern = re.compile(r"([A-Za-z]\w*(?:(?:@@MEM@@|\.)\w+)*)\s*\[\[([^\[\]]+)\]\]")
-    expr = item_pattern.sub(lambda m: f"{translate_member_expr(m.group(1))}[{translate_subscript(m.group(2))}]", expr)
+    expr = item_pattern.sub(replace_double_subscript, expr)
     pattern = re.compile(r"([A-Za-z]\w*(?:(?:@@MEM@@|\.)\w+)*)\s*\[([^\[\]]*)\]")
     return pattern.sub(replace_single_subscript, expr)
+
+
+def replace_double_subscript(match: re.Match[str]) -> str:
+    base = translate_member_expr(match.group(1))
+    index = match.group(2).strip()
+    if is_string_literal(index):
+        return f"{base}.{r_name(index[1:-1])}"
+    placeholder = re.fullmatch(r"__R_STR_(\d+)__", index)
+    if placeholder:
+        return f"{base}.__R_ATTR_{placeholder.group(1)}__"
+    return f"{base}[{translate_subscript(index)}]"
 
 
 def replace_single_subscript(match: re.Match[str]) -> str:
@@ -902,11 +1070,13 @@ def translate_member_expr(expr: str) -> str:
 
 
 def translate_subscript(index: str, *, base: str | None = None) -> str:
-    index = index.strip()
+    index = strip_outer_parens(index)
     if has_top_level_comma(index):
         return translate_matrix_subscript(index, base=base)
     if index == ":":
         return ":"
+    if is_string_index_expr(index):
+        return translate_expr(index)
     range_parts = split_top_level_range(index)
     if range_parts is not None:
         start, stop = range_parts
@@ -955,6 +1125,7 @@ def split_top_level_range(text: str) -> tuple[str, str] | None:
 def translate_matrix_subscript(index: str, *, base: str | None = None) -> str:
     parts = split_subscript_args(index)
     out: list[str] = []
+    advanced_axes: list[int] = []
     for axis, part in enumerate(parts):
         item = part.strip()
         if is_subscript_option(item):
@@ -965,16 +1136,40 @@ def translate_matrix_subscript(index: str, *, base: str | None = None) -> str:
             out.append(f"{base}_colnames.index({item})")
         elif is_logical_subscript(item):
             out.append(item)
+            advanced_axes.append(len(out) - 1)
         else:
-            out.append(translate_subscript(item))
+            translated = translate_subscript(item)
+            out.append(translated)
+            if is_advanced_matrix_index(translated):
+                advanced_axes.append(len(out) - 1)
+    if len(out) == 2 and advanced_axes == [0, 1]:
+        return f"np.ix_({out[0]}, {out[1]})"
     return ", ".join(out)
+
+
+def is_advanced_matrix_index(index: str) -> bool:
+    if index == ":":
+        return False
+    if re.fullmatch(r"\(?\d+\)?\s*-\s*1", index):
+        return False
+    return any(token in index for token in ("np.arange", "np.r_", "r_seq", "np.array", "r_c("))
 
 
 def is_string_literal(text: str) -> bool:
     return len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}
 
 
+def is_string_index_expr(text: str) -> bool:
+    if re.fullmatch(r"__R_STR_\d+__", text):
+        return True
+    raw_call = parse_full_call(text)
+    if raw_call is None or raw_call[0].lower() != "c":
+        return False
+    return all(re.fullmatch(r"__R_STR_\d+__", arg.strip()) or is_string_literal(arg.strip()) for arg in raw_call[1])
+
+
 def is_subscript_option(item: str) -> bool:
+    item = strip_outer_parens(item)
     pos = find_top_level_operator(item, "=")
     return pos >= 0 and item[:pos].strip().lower() in {"drop"}
 
@@ -1054,7 +1249,7 @@ def translate_call(name: str, args: list[str]) -> str:
     if name.startswith("np."):
         return name + "(" + ", ".join(py_args) + ")"
     if lname == "c":
-        return translate_c_call(py_args)
+        return translate_c_call(args)
     if lname == "list":
         return translate_list_call(args)
     if lname == "data.frame":
@@ -1108,6 +1303,8 @@ def translate_call(name: str, args: list[str]) -> str:
     if lname == "dim":
         return "np.array(" + py_args[0] + ".shape)"
     if lname == "crossprod":
+        if len(args) > 2:
+            raise R2PyError("crossprod supports at most 2 arguments")
         rhs = py_args[1] if len(py_args) > 1 else py_args[0]
         return "(" + py_args[0] + ").T @ (" + rhs + ")"
     if lname == "solve":
@@ -1116,7 +1313,7 @@ def translate_call(name: str, args: list[str]) -> str:
         return "np.linalg.solve(" + py_args[0] + ", " + py_args[1] + ")"
     if lname == "det":
         return "np.linalg.det(" + py_args[0] + ")"
-    if lname in {"sum", "mean", "median"}:
+    if lname in {"sum", "mean", "median", "prod"}:
         return f"np.{lname}(" + ", ".join(py_args) + ")"
     if lname == "var":
         return "var_r(" + py_args[0] + ")"
@@ -1158,6 +1355,12 @@ def translate_call(name: str, args: list[str]) -> str:
         return "np.cumsum(" + py_args[0] + ")"
     if lname == "findinterval":
         return "np.searchsorted(" + py_args[1] + ", " + py_args[0] + ", side='right')"
+    if lname == "range":
+        xarg = py_args[0] if py_args else "np.array([])"
+        na_rm = keyword_arg(args, "na.rm", default="False")
+        if na_rm.lower() == "true":
+            return "np.array([np.nanmin(" + xarg + "), np.nanmax(" + xarg + ")])"
+        return "np.array([np.min(" + xarg + "), np.max(" + xarg + ")])"
     if lname == "which":
         return "np.nonzero(" + py_args[0] + ")[0] + 1"
     if lname == "which.min":
@@ -1185,7 +1388,9 @@ def translate_call(name: str, args: list[str]) -> str:
     if lname == "summary":
         return "summary_lm_py(" + py_args[0] + ")"
     if lname == "length":
-        return "len(" + py_args[0] + ")"
+        return "r_length(" + py_args[0] + ")"
+    if lname == "names":
+        return "r_names(" + py_args[0] + ")"
     if lname == "nrow":
         return py_args[0] + ".shape[0]"
     if lname == "ncol":
@@ -1197,7 +1402,7 @@ def translate_call(name: str, args: list[str]) -> str:
     if lname == "seq_len":
         return "np.arange(1, " + py_args[0] + " + 1)"
     if lname == "rep":
-        return "np.repeat(" + ", ".join(py_args) + ")"
+        return translate_rep_call(args)
     if lname == "numeric":
         return "np.zeros(" + py_args[0] + ")"
     if lname == "integer":
@@ -1230,10 +1435,36 @@ def print_colnames_arg(raw_expr: str, *, allow_simple: bool = False) -> str:
     return ""
 
 
-def translate_c_call(py_args: list[str]) -> str:
-    if any(is_vector_expr(arg) for arg in py_args):
-        return "np.concatenate([" + ", ".join(f"np.ravel({arg})" for arg in py_args) + "])"
-    return "np.array([" + ", ".join(py_args) + "])"
+def translate_c_call(args: list[str]) -> str:
+    values: list[str] = []
+    names: list[str | None] = []
+    for arg in args:
+        pos = find_top_level_operator(arg, "=")
+        if pos >= 0:
+            names.append(arg[:pos].strip())
+            values.append(translate_expr(arg[pos + 1 :].strip()))
+        else:
+            names.append(None)
+            values.append(translate_expr(arg))
+    if any(name is not None for name in names):
+        py_names = "[" + ", ".join(repr(name) if name is not None else "None" for name in names) + "]"
+        return "r_c(" + ", ".join(values) + f", names={py_names})"
+    return "r_c(" + ", ".join(values) + ")"
+
+
+def translate_rep_call(args: list[str]) -> str:
+    if not args:
+        raise R2PyError("rep requires a value")
+    x = translate_expr(args[0])
+    positional = positional_args(args)
+    times = keyword_arg(args, "times", default=positional[1] if len(positional) > 1 else "1")
+    each = keyword_arg(args, "each", default="1")
+    py_each = translate_expr(each)
+    py_times = translate_expr(times)
+    repeated = f"np.repeat({x}, {py_each})"
+    if py_times == "1":
+        return repeated
+    return f"np.tile({repeated}, {py_times})"
 
 
 def is_vector_expr(expr: str) -> bool:
@@ -1546,6 +1777,39 @@ def replace_names(expr: str) -> str:
     return re.sub(r"(?<![\w.])([A-Za-z]\w*(?:\.\w+)*)\b", lambda m: r_name(m.group(1)), expr)
 
 
+def apply_recycled_binops(expr: str) -> str:
+    if not any(op in expr for op in ["+", "-", "*", "/"]):
+        return expr
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        return expr
+
+    op_map = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul", ast.Div: "div"}
+
+    class Rewriter(ast.NodeTransformer):
+        def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+            node = self.generic_visit(node)
+            op_name = op_map.get(type(node.op))
+            if op_name is None:
+                return node
+            return ast.copy_location(
+                ast.Call(
+                    func=ast.Name(id=f"r_{op_name}", ctx=ast.Load()),
+                    args=[node.left, node.right],
+                    keywords=[],
+                ),
+                node,
+            )
+
+    tree = Rewriter().visit(tree)
+    ast.fix_missing_locations(tree)
+    try:
+        return ast.unparse(tree.body)  # type: ignore[attr-defined]
+    except Exception:
+        return expr
+
+
 def r_name(name: str) -> str:
     constants = {"True", "False", "None", "np", "stats", "nan", "inf", "and", "or", "not", "is", "in", "if", "else", "lambda"}
     if name in constants or "." in name or name.startswith("np.") or name.startswith("stats."):
@@ -1662,6 +1926,107 @@ def restore_string_literals(expr: str, strings: list[str]) -> str:
     return expr
 
 
+def round_numeric_tokens(text: str, digits: int | None) -> str:
+    if digits is None:
+        return text
+
+    number_re = re.compile(
+        r"(?<![A-Za-z0-9_])([+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?|[Nn][Aa][Nn]|[Ii][Nn][Ff]|[+-][Ii][Nn][Ff]))(?![A-Za-z0-9_])"
+    )
+
+    def repl(match: re.Match[str]) -> str:
+        token = match.group(1)
+        low = token.lower()
+        if low in {"nan", "+nan", "-nan", "inf", "+inf", "-inf"}:
+            return token
+        try:
+            value = float(token.replace("D", "E").replace("d", "E"))
+        except Exception:
+            return token
+        if not math.isfinite(value):
+            return token
+        return f"{value:.{int(digits)}f}"
+
+    return number_re.sub(repl, text)
+
+
+def normalize_output(text: str, digits: int | None = None) -> list[str]:
+    if not text:
+        return []
+    out: list[str] = []
+    index_re = re.compile(r"^\s*\[\d+\]\s*")
+    for line in text.splitlines():
+        line = index_re.sub("", line.rstrip("\n"))
+        line = round_numeric_tokens(line, digits)
+        line = normalize_output_spacing(line)
+        line = normalize_quoted_string_tokens(line)
+        out.append(line)
+    return out
+
+
+def normalize_output_spacing(line: str) -> str:
+    return re.sub(r"\s+", " ", line.strip())
+
+
+def normalize_quoted_string_tokens(line: str) -> str:
+    parts = line.split(" ")
+    if parts and all(re.fullmatch(r'"[^"\s]*"|\'[^\'\s]*\'|[^"\']+', part) for part in parts):
+        return " ".join(part[1:-1] if is_string_literal(part) else part for part in parts)
+    return line
+
+def outputs_match(a: str, b: str, *, digits: int | None = None) -> tuple[bool, str]:
+    a_lines = normalize_output(a, digits)
+    b_lines = normalize_output(b, digits)
+    if a_lines == b_lines:
+        return True, ""
+
+    import difflib
+
+    diff = "\n".join(difflib.unified_diff(a_lines, b_lines, fromfile="R", tofile="Python", lineterm=""))
+    return False, diff
+
+
+def numeric_output_stats(text: str) -> tuple[int, float, float, float]:
+    values: list[float] = []
+    display_marker_re = re.compile(r"(?:^\s*\[\d+,?\]\s*)|\[,\d+\]")
+    number_re = re.compile(
+        r"(?<![A-Za-z0-9_])([+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?|[Nn][Aa][Nn]|[Ii][Nn][Ff]))(?![A-Za-z0-9_])"
+    )
+    for line in text.splitlines():
+        line = display_marker_re.sub("", line)
+        for match in number_re.finditer(line):
+            values.append(float(match.group(1).replace("D", "E").replace("d", "E")))
+    if not values:
+        return 0, math.nan, math.nan, 0.0
+    finite_values = [value for value in values if math.isfinite(value)]
+    if finite_values:
+        return len(values), min(finite_values), max(finite_values), math.fsum(finite_values)
+    return len(values), math.nan, math.nan, math.nan
+
+
+def format_numeric_stats(stats: tuple[int, float, float, float]) -> str:
+    count, min_value, max_value, sum_value = stats
+    return f"count={count} min={min_value:.12g} max={max_value:.12g} sum={sum_value:.12g}"
+
+
+def numeric_stats_match(a: tuple[int, float, float, float], b: tuple[int, float, float, float]) -> tuple[bool, str]:
+    labels = ("count", "min", "max", "sum")
+    for i, label in enumerate(labels):
+        if label == "count":
+            if a[i] != b[i]:
+                return False, f"{label}: R={a[i]} Python={b[i]}"
+            continue
+        if not numeric_stat_value_match(a[i], b[i]):
+            return False, f"{label}: R={a[i]:.12g} Python={b[i]:.12g}"
+    return True, ""
+
+
+def numeric_stat_value_match(a: float, b: float) -> bool:
+    if math.isnan(a) or math.isnan(b):
+        return math.isnan(a) and math.isnan(b)
+    return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)
+
+
 def run_python(path: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run([sys.executable, str(path)], text=True, capture_output=True)
 
@@ -1675,6 +2040,20 @@ def print_process_output(result: subprocess.CompletedProcess[str]) -> None:
         print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
     if result.stderr:
         print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr)
+
+
+def print_result_output(result: subprocess.CompletedProcess[str], digits: int | None) -> None:
+    if result.stdout:
+        print(
+            round_numeric_tokens(result.stdout, digits),
+            end="" if result.stdout.endswith("\n") else "\n",
+        )
+    if result.stderr:
+        print(
+            round_numeric_tokens(result.stderr, digits),
+            end="" if result.stderr.endswith("\n") else "\n",
+            file=sys.stderr,
+        )
 
 
 def check_python_compile(path: Path) -> subprocess.CompletedProcess[str]:
@@ -1710,8 +2089,49 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-py-compile", action="store_true", help="skip python -m py_compile check")
     parser.add_argument("--run", action="store_true", help="run the generated Python")
     parser.add_argument("--run-both", action="store_true", help="run original R and generated Python")
+    parser.add_argument(
+        "--run-diff",
+        action="store_true",
+        help="run original R and generated Python and compare outputs",
+    )
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="run original R and generated Python and compare numeric output stats",
+    )
+    parser.add_argument(
+        "--round",
+        type=int,
+        default=None,
+        metavar="N",
+        help="round floating-point data in displayed Python output to N decimal places",
+    )
+    parser.add_argument(
+        "--round-both",
+        type=int,
+        default=None,
+        metavar="N",
+        help="round floating-point data in displayed R and Python output to N decimal places",
+    )
     parser.add_argument("--rscript", default="rscript", help="command used to run R scripts")
     args = parser.parse_args(argv)
+
+    if args.round is not None and args.round < 0:
+        print("Option error: --round requires a nonnegative integer.")
+        return 1
+    if args.round_both is not None and args.round_both < 0:
+        print("Option error: --round-both requires a nonnegative integer.")
+        return 1
+    if args.round is not None and args.round_both is not None:
+        print("Option conflict: --round and --round-both cannot be used together.")
+        return 1
+
+    if args.run_diff and args.stats:
+        print("Option conflict: --run-diff and --stats cannot be used together.")
+        return 1
+
+    if args.run_diff or args.stats:
+        args.run_both = True
 
     try:
         source = args.source.read_text(encoding="utf-8-sig")
@@ -1731,22 +2151,50 @@ def main(argv: list[str] | None = None) -> int:
             print("Python syntax check failed:", file=sys.stderr)
             print_process_output(compile_result)
             return compile_result.returncode
+
+    python_round_digits = args.round_both if args.round_both is not None else args.round
+    r_round_digits = args.round_both
+
     if args.run_both:
         print("Run (R):", args.rscript, args.source)
         r_result = run_r(args.source, args.rscript)
         print("Run (R):", "PASS" if r_result.returncode == 0 else f"FAIL exit={r_result.returncode}")
-        print_process_output(r_result)
+        print_result_output(r_result, r_round_digits)
         print("Run (Python):", sys.executable, out)
         py_result = run_python(out)
         print("Run (Python):", "PASS" if py_result.returncode == 0 else f"FAIL exit={py_result.returncode}")
-        print_process_output(py_result)
+        print_result_output(py_result, python_round_digits)
+        if args.run_diff:
+            compare_digits = args.round_both if args.round_both is not None else args.round
+            same, diff = outputs_match(
+                r_result.stdout,
+                py_result.stdout,
+                digits=compare_digits,
+            )
+            if not same:
+                print("Run (diff):", "FAIL")
+                print(diff)
+                return 1
+            print("Run (diff):", "PASS")
+        if args.stats:
+            r_stats = numeric_output_stats(r_result.stdout)
+            py_stats = numeric_output_stats(py_result.stdout)
+            print("Stats (R):", format_numeric_stats(r_stats))
+            print("Stats (Python):", format_numeric_stats(py_stats))
+            same, detail = numeric_stats_match(r_stats, py_stats)
+            if not same:
+                print("Stats:", "FAIL")
+                print(detail)
+                return 1
+            print("Stats:", "PASS")
         return 0 if r_result.returncode == 0 and py_result.returncode == 0 else 1
     if args.run:
         result = run_python(out)
-        print_process_output(result)
+        print_result_output(result, python_round_digits)
         return result.returncode
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
