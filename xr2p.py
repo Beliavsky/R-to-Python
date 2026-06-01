@@ -69,6 +69,8 @@ def translate_source(source: str) -> str:
     python = inject_known_fast_paths(python)
     if "SimpleNamespace" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom types import SimpleNamespace\n", 1)
+    if "pd." in python or "r_subset(" in python:
+        python = python.replace("import numpy as np\n", "import numpy as np\nimport pandas as pd\n", 1)
     return python
 
 
@@ -80,6 +82,8 @@ def add_runtime_helpers(python: str) -> str:
 def r_length(x):
     if "RNamedVector" in globals() and isinstance(x, RNamedVector):
         return len(x.values)
+    if isinstance(x, SimpleNamespace):
+        return len(getattr(x, "_r_names", vars(x)))
     if isinstance(x, np.ndarray):
         return x.size
     try:
@@ -88,9 +92,72 @@ def r_length(x):
         return 1
 """.strip()
         )
-    if "r_c(" in python or "r_names(" in python:
+    if "r_apply(" in python:
         helpers.append(
             """
+def r_apply(x, margin, func):
+    arr = np.asarray(x)
+    keep_axes = np.atleast_1d(margin).astype(int) - 1
+    reduce_axes = tuple(axis for axis in range(arr.ndim) if axis not in set(keep_axes))
+    if func == "sum":
+        return np.sum(arr, axis=reduce_axes)
+    if func == "mean":
+        return np.mean(arr, axis=reduce_axes)
+    if func == "median":
+        return np.median(arr, axis=reduce_axes)
+    if func == "var":
+        return np.var(arr, axis=reduce_axes, ddof=1)
+    if func == "min":
+        return np.min(arr, axis=reduce_axes)
+    if func == "max":
+        return np.max(arr, axis=reduce_axes)
+    raise ValueError(f"unsupported apply function: {func}")
+""".strip()
+        )
+    if "r_subset(" in python:
+        helpers.append(
+            """
+def r_subset(x, *keys):
+    if isinstance(x, pd.DataFrame):
+        if len(keys) == 1:
+            key = keys[0]
+            if isinstance(key, str):
+                return x[key]
+            return x.iloc[key]
+        row_key, col_key = keys
+        if isinstance(col_key, str):
+            return x.loc[:, col_key] if isinstance(row_key, slice) else x.loc[x.index[row_key], col_key]
+        return x.iloc[row_key, col_key]
+    return x[keys[0] if len(keys) == 1 else keys]
+
+
+def r_col_key(x, name, colnames=None):
+    if isinstance(x, pd.DataFrame):
+        return name
+    return colnames.index(name)
+""".strip()
+        )
+    if "r_c(" in python or "r_names(" in python or "RList(" in python:
+        helpers.append(
+            """
+class RList(SimpleNamespace):
+    def __init__(self, **kwargs):
+        names = list(kwargs.pop("_r_names", [name for name in kwargs if not name.startswith("_")]))
+        object.__setattr__(self, "_r_names", names)
+        for name, value in kwargs.items():
+            object.__setattr__(self, name, value)
+
+    def __setattr__(self, name, value):
+        object.__setattr__(self, name, value)
+        if not name.startswith("_") and name not in self._r_names:
+            self._r_names.append(name)
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return getattr(self, key)
+        return getattr(self, self._r_names[int(key)])
+
+
 class RNamedVector:
     def __init__(self, values, names):
         self.values = np.asarray(values)
@@ -147,6 +214,10 @@ def r_c(*values, names=None):
 def r_names(x):
     if "RNamedVector" in globals() and isinstance(x, RNamedVector):
         return np.array(x.names)
+    if "pd" in globals() and isinstance(x, pd.DataFrame):
+        return np.array(x.columns)
+    if isinstance(x, SimpleNamespace):
+        return np.array(getattr(x, "_r_names", [name for name in vars(x) if not name.startswith("_")]))
     return None
 """.strip()
         )
@@ -206,7 +277,11 @@ def r_print(*args, digits=None, colnames=None):
         print(*args)
         return
     x = args[0]
-    if "RNamedVector" in globals() and isinstance(x, RNamedVector):
+    if "pd" in globals() and isinstance(x, pd.DataFrame):
+        print(x.to_string(index=False))
+    elif "pd" in globals() and isinstance(x, pd.Series):
+        print(" ".join(r_format(v, digits) for v in x.to_numpy()))
+    elif "RNamedVector" in globals() and isinstance(x, RNamedVector):
         labels = [str(label) for label in x.names]
         values = [r_format(v, digits) for v in x.values]
         widths = [max(len(label), len(value)) for label, value in zip(labels, values)]
@@ -604,6 +679,35 @@ def translate_statement(line: str) -> list[str]:
     if is_metadata_assignment(line):
         return ["pass  # R metadata assignment omitted"]
 
+    member_subscript_assign = re.match(r"^([A-Za-z]\w*)\$([A-Za-z]\w*)\s*\[(.+)\]\s*(?:<-|=)\s*(.+)$", line)
+    if member_subscript_assign:
+        obj, field, index, rhs = member_subscript_assign.groups()
+        py_obj = r_name(obj)
+        py_field = r_name(field)
+        py_index = translate_expr(index)
+        py_rhs = translate_expr(rhs)
+        return [
+            f"if 'pd' in globals() and isinstance({py_obj}, pd.DataFrame):",
+            INDENT + f"{py_obj}.loc[{py_index}, {py_field!r}] = {py_rhs}",
+            "else:",
+            INDENT + f"{py_obj}.{py_field}[{py_index}] = {py_rhs}",
+        ]
+
+    member_assign = re.match(r"^([A-Za-z]\w*)\$([A-Za-z]\w*)\s*(?:<-|=)\s*(.+)$", line)
+    if member_assign:
+        obj, field, rhs = member_assign.groups()
+        py_obj = r_name(obj)
+        py_field = r_name(field)
+        py_rhs = translate_expr(rhs)
+        return [
+            f"if 'pd' in globals() and isinstance({py_obj}, pd.DataFrame):",
+            INDENT + f"{py_obj}[{py_field!r}] = {py_rhs}",
+            "else:",
+            INDENT + f"{py_obj}.{py_field} = {py_rhs}",
+            INDENT + f"if hasattr({py_obj}, '_r_names') and {py_field!r} not in {py_obj}._r_names:",
+            INDENT * 2 + f"{py_obj}._r_names.append({py_field!r})",
+        ]
+
     full_call = parse_full_call(line)
     if full_call is not None and full_call[0].lower() == "return":
         _name, args = full_call
@@ -991,7 +1095,7 @@ def replace_innermost_call(expr: str) -> str:
     pattern = re.compile(r"(?<![\w.])([A-Za-z]\w*(?:\.\w+)*)\s*\(")
     for match in pattern.finditer(expr):
         name = match.group(1)
-        if name.startswith(("np.", "stats.")) or name in {"SimpleNamespace", "int", "float", "str", "len"}:
+        if name.startswith(("np.", "stats.", "pd.")) or name in {"SimpleNamespace", "RList", "RNamedVector", "r_subset", "r_col_key", "getattr", "globals", "int", "float", "str", "len"}:
             continue
         open_pos = expr.find("(", match.start())
         close_pos = find_matching_paren(expr, open_pos)
@@ -1021,6 +1125,8 @@ def replace_double_subscript(match: re.Match[str]) -> str:
     placeholder = re.fullmatch(r"__R_STR_(\d+)__", index)
     if placeholder:
         return f"{base}.__R_ATTR_{placeholder.group(1)}__"
+    if re.fullmatch(r"\d+", index):
+        return f"getattr({base}, {base}._r_names[{int(index) - 1}])"
     return f"{base}[{translate_subscript(index)}]"
 
 
@@ -1029,6 +1135,8 @@ def replace_single_subscript(match: re.Match[str]) -> str:
     index = match.group(2).strip()
     if has_top_level_comma(index) and any_negative_matrix_subscript(index):
         return replace_negative_matrix_subscript(base, index)
+    if has_top_level_comma(index):
+        return f"r_subset({base}, {translate_subscript(index, base=base)})"
     if is_negative_integer_subscript(index):
         item = index.replace(" ", "")[1:]
         return f"np.delete({base}, ({item}) - 1)"
@@ -1131,9 +1239,9 @@ def translate_matrix_subscript(index: str, *, base: str | None = None) -> str:
         if is_subscript_option(item):
             continue
         if item == "":
-            out.append(":")
-        elif axis == 1 and base and is_string_literal(item):
-            out.append(f"{base}_colnames.index({item})")
+            out.append("slice(None)" if base else ":")
+        elif axis == 1 and base and (is_string_literal(item) or re.fullmatch(r"__R_STR_\d+__", item)):
+            out.append(f"r_col_key({base}, {item}, globals().get('{base}_colnames'))")
         elif is_logical_subscript(item):
             out.append(item)
             advanced_axes.append(len(out) - 1)
@@ -1258,6 +1366,8 @@ def translate_call(name: str, args: list[str]) -> str:
         return translate_vector_call(args)
     if lname == "matrix":
         return translate_matrix_call(args)
+    if lname == "array":
+        return translate_array_call(args)
     if lname == "cbind":
         return translate_cbind_call(args)
     if lname == "print":
@@ -1307,6 +1417,11 @@ def translate_call(name: str, args: list[str]) -> str:
             raise R2PyError("crossprod supports at most 2 arguments")
         rhs = py_args[1] if len(py_args) > 1 else py_args[0]
         return "(" + py_args[0] + ").T @ (" + rhs + ")"
+    if lname == "tcrossprod":
+        if len(args) > 2:
+            raise R2PyError("tcrossprod supports at most 2 arguments")
+        rhs = py_args[1] if len(py_args) > 1 else py_args[0]
+        return "(" + py_args[0] + ") @ (" + rhs + ").T"
     if lname == "solve":
         if len(py_args) == 1:
             return "np.linalg.inv(" + py_args[0] + ")"
@@ -1482,13 +1597,19 @@ def translate_apply_call(args: list[str]) -> str:
     x = translate_expr(args[0])
     margin = translate_expr(args[1])
     func = translate_expr(args[2])
-    axis = "0" if margin == "2" else "1"
-    if func in {"max", "np.max"}:
-        return f"np.max({x}, axis={axis})"
-    if func in {"min", "np.min"}:
-        return f"np.min({x}, axis={axis})"
     if func in {"sum", "np.sum"}:
-        return f"np.sum({x}, axis={axis})"
+        return f"r_apply({x}, {margin}, 'sum')"
+    if func in {"mean", "np.mean"}:
+        return f"r_apply({x}, {margin}, 'mean')"
+    if func in {"median", "np.median"}:
+        return f"r_apply({x}, {margin}, 'median')"
+    if func in {"var", "var_r"}:
+        return f"r_apply({x}, {margin}, 'var')"
+    if func in {"min", "np.min"}:
+        return f"r_apply({x}, {margin}, 'min')"
+    if func in {"max", "np.max"}:
+        return f"r_apply({x}, {margin}, 'max')"
+    axis = "0" if margin == "2" else "1"
     return f"np.apply_along_axis({func}, {axis}, {x})"
 
 
@@ -1523,8 +1644,8 @@ def translate_data_frame_call(args: list[str]) -> str:
             else:
                 unnamed += 1
                 name = f"x{unnamed}"
-        fields.append(f"{name}={value}")
-    return "SimpleNamespace(" + ", ".join(fields) + ")"
+        fields.append(f"{name!r}: {value}")
+    return "pd.DataFrame({" + ", ".join(fields) + "})"
 
 
 def translate_sweep_call(args: list[str]) -> str:
@@ -1568,6 +1689,7 @@ def translate_backsolve_call(args: list[str]) -> str:
 def translate_list_call(args: list[str]) -> str:
     fields: list[str] = []
     values: list[str] = []
+    names: list[str] = []
     for i, arg in enumerate(args):
         pos = find_top_level_operator(arg, "=")
         if pos >= 0:
@@ -1579,6 +1701,7 @@ def translate_list_call(args: list[str]) -> str:
         if re.match(r"^[A-Za-z_]\w*$", name):
             if pos >= 0:
                 fields.append(f"{name}={value}")
+                names.append(name)
                 if name == "table" and re.match(r"^[A-Za-z_]\w*$", value):
                     fields.append(
                         f"{name}_colnames=({value}_colnames if {value + '_colnames'!r} in locals() else None)"
@@ -1588,9 +1711,9 @@ def translate_list_call(args: list[str]) -> str:
         else:
             values.append(value)
     if fields and not values:
-        return "SimpleNamespace(" + ", ".join(fields) + ")"
+        return "RList(" + ", ".join(fields + [f"_r_names={names!r}"]) + ")"
     if fields:
-        return "SimpleNamespace(" + ", ".join(fields) + ")"
+        return "RList(" + ", ".join(fields + [f"_r_names={names!r}"]) + ")"
     return "[" + ", ".join(values) + "]"
 
 
@@ -1676,6 +1799,17 @@ def translate_matrix_call(args: list[str]) -> str:
     py_nrow = translate_expr(nrow)
     py_ncol = translate_expr(ncol)
     return f"np.resize(np.array({data}), ({py_nrow}) * ({py_ncol})).reshape(({py_nrow}, {py_ncol}), order={order})"
+
+
+def translate_array_call(args: list[str]) -> str:
+    if not args:
+        raise R2PyError("array requires data")
+    data = translate_expr(args[0])
+    dim = keyword_arg(args, "dim")
+    if dim is None:
+        return f"np.array({data})"
+    py_dim = translate_expr(dim)
+    return f"(lambda _data, _dim: np.resize(np.array(_data), int(np.prod(_dim))).reshape(tuple(np.asarray(_dim, dtype=int)), order='F'))({data}, {py_dim})"
 
 
 def translate_seq_call(args: list[str]) -> str:
