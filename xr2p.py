@@ -93,7 +93,7 @@ def translate_source(source: str) -> str:
     python = inject_known_fast_paths(python)
     if "SimpleNamespace" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom types import SimpleNamespace\n", 1)
-    if "pd." in python or "lm_py(" in python or "stack_py(" in python or "unstack_py(" in python or "r_with(" in python or "r_within(" in python or "r_member(" in python or "r_vec_subset(" in python or "r_matrix_index_get(" in python or "r_matrix_index_set(" in python or "r_subset(" in python or "r_set_subset(" in python or "r_subset_df(" in python or "r_df_col(" in python or "r_data_frame(" in python or "r_model_matrix(" in python or "tribble_py(" in python or "add_row_py(" in python or "add_column_py(" in python:
+    if "pd." in python or "read_table(" in python or "lm_py(" in python or "stack_py(" in python or "unstack_py(" in python or "r_with(" in python or "r_within(" in python or "r_member(" in python or "r_vec_subset(" in python or "r_matrix_index_get(" in python or "r_matrix_index_set(" in python or "r_subset(" in python or "r_set_subset(" in python or "r_subset_df(" in python or "r_df_col(" in python or "r_data_frame(" in python or "r_model_matrix(" in python or "tribble_py(" in python or "add_row_py(" in python or "add_column_py(" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nimport pandas as pd\n", 1)
     if "tempfile." in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nimport tempfile\n", 1)
@@ -1391,7 +1391,7 @@ def r_rank(x):
     return ranks
 """.strip()
         )
-    if "r_factor(" in python or "r_levels(" in python or "r_table(" in python or "r_tapply(" in python or "cut_py(" in python or "r_model_matrix(" in python or "r_df_col(" in python or "r_data_frame(" in python or "tribble_py(" in python or "add_row_py(" in python or "add_column_py(" in python:
+    if "read_table(" in python or "r_factor(" in python or "r_levels(" in python or "r_table(" in python or "r_tapply(" in python or "cut_py(" in python or "r_model_matrix(" in python or "r_df_col(" in python or "r_data_frame(" in python or "tribble_py(" in python or "add_row_py(" in python or "add_column_py(" in python:
         helpers.append(
             """
 class RFactor:
@@ -1535,6 +1535,15 @@ def add_column_py(df, **kwargs):
         else:
             out[name] = col
     return out
+
+
+def read_table(file, header=False, sep=None, quote=None, **kwargs):
+    table_sep = r"\\s+" if sep is None or sep == "" else sep
+    table_header = 0 if header is True else None
+    read_kwargs = {}
+    if quote:
+        read_kwargs["quotechar"] = quote
+    return pd.read_csv(file, sep=table_sep, header=table_header, **read_kwargs)
 
 
 def r_model_matrix(data, response, terms):
