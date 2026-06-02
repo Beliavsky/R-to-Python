@@ -121,7 +121,7 @@ def preprocess_simple_inline_r(source: str) -> str:
     """
     out: list[str] = []
     pending_closes: list[str] = []
-    for raw in join_r_continuation_lines(source):
+    for raw in normalize_source_indentation(join_r_continuation_lines(source)):
         line = expand_inline_function_assignment(raw)
         pieces = expand_one_line_control(line)
         for piece in pieces:
@@ -134,6 +134,23 @@ def preprocess_simple_inline_r(source: str) -> str:
             pending_closes.append("}")
     out.extend(pending_closes)
     return "\n".join(out) + ("\n" if source.endswith("\n") else "")
+
+
+def normalize_source_indentation(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    depth = 0
+    for raw in lines:
+        stripped = raw.strip()
+        if not stripped:
+            out.append("")
+            continue
+        if stripped.startswith("}"):
+            depth = max(depth - stripped.count("}"), 0)
+        out.append(raw if depth > 0 else stripped)
+        opens = stripped.count("{")
+        closes = stripped.count("}")
+        depth = max(depth + opens - closes, 0)
+    return out
 
 
 def join_r_continuation_lines(source: str) -> list[str]:
@@ -159,9 +176,28 @@ def r_line_continues(line: str) -> bool:
         return False
     if stripped.endswith(("{", "}", ";")):
         return False
+    if has_unbalanced_delimiters(stripped):
+        return True
     if stripped.endswith("=") and len(stripped) >= 2 and stripped[-2] not in {"=", "!", "<", ">"}:
         return True
     return bool(re.search(r"(\+|-|\*|/|\||&|,)\s*$", stripped))
+
+
+def has_unbalanced_delimiters(text: str) -> bool:
+    depth = 0
+    quote = ""
+    for ch in text:
+        if quote:
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in {"'", '"'}:
+            quote = ch
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth = max(depth - 1, 0)
+    return depth > 0
 
 
 def expand_inline_function_assignment(line: str) -> str:
