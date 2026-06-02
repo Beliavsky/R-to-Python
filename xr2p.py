@@ -2129,7 +2129,7 @@ def repair_generated_syntax_cleanup(python: str) -> str:
     block_depth = 0
     for line in lines:
         stripped = line.strip()
-        if stripped == "}":
+        if stripped in {"}", "end"}:
             block_depth = max(block_depth - 1, 0)
             continue
         if re.match(r"^(library|require)\s*\(", stripped):
