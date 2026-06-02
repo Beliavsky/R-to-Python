@@ -2255,6 +2255,8 @@ def should_return_tail_expression(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
         return False
+    if stripped == "return":
+        return False
     starters = ("return ", "return(", "print(", "assert ", "if ", "elif ", "else:", "for ", "while ", "break", "continue")
     if stripped.startswith(starters):
         return False
@@ -2455,6 +2457,9 @@ def translate_statement(line: str) -> list[str]:
 
     if line == "next":
         return ["continue"]
+
+    if line == "return":
+        return ["return"]
 
     metadata = translate_metadata_assignment(line)
     if metadata is not None:
