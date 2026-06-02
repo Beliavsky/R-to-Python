@@ -1,0 +1,30 @@
+# Python caches and test caches
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Generated transpiler outputs in the repository root.
+# Keep the actual project sources.
+x*.py
+!xr2p.py
+!xr2p_batch.py
+
+# Generated/intermediate Fortran artifacts
+*.mod
+*.f90
+
+# Local temp/debug files
+temp.py
+temp_*.txt
+tmp_*.py
+tmp_*.r
+do.txt
+
+# Personal/local batch scripts
+copyod.bat
+pr.bat
