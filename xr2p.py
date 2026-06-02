@@ -44,7 +44,7 @@ def translate_source(source: str) -> str:
     PENDING_FUNCTION_PARAMS = None
     out = ["import numpy as np", ""]
     indent = 0
-    for line in logical_r_lines(source):
+    for line in logical_r_lines(preprocess_simple_inline_r(source)):
         if not line:
             continue
         while line.startswith("}"):
@@ -106,6 +106,93 @@ def translate_source(source: str) -> str:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom pathlib import Path\n", 1)
     python = remove_unused_numpy_import(python)
     return python
+
+
+def preprocess_simple_inline_r(source: str) -> str:
+    """Rewrite common compact R forms into braced multi-line forms.
+
+    This keeps the main translator small while accepting common public-domain
+    numerical R styles such as:
+      f = function(x) { x^2 }
+      if (n == 1) return(0)
+      for (i in 1:n) s = s + x[i]
+    """
+    out: list[str] = []
+    pending_closes: list[str] = []
+    for raw in source.splitlines():
+        line = expand_inline_function_assignment(raw)
+        pieces = expand_one_line_control(line)
+        for piece in pieces:
+            out.append(piece)
+            if pending_closes and piece.strip() and not is_open_control_line(piece):
+                out.extend(pending_closes)
+                pending_closes.clear()
+        stripped = line.strip()
+        if is_open_control_line(line) and not stripped.endswith("{"):
+            pending_closes.append("}")
+    out.extend(pending_closes)
+    return "\n".join(out) + ("\n" if source.endswith("\n") else "")
+
+
+def expand_inline_function_assignment(line: str) -> str:
+    match = re.match(r"^(\s*)([A-Za-z_][\w.]*\s*(?:<-|=)\s*)function\s*\(([^)]*)\)\s*\{\s*(.*?)\s*\}\s*$", line)
+    if not match:
+        return line
+    indent, lhs, params, body = match.groups()
+    body = body.strip()
+    return f"{indent}{lhs}function({params}) {{\n{indent}{INDENT}{body}\n{indent}}}"
+
+
+def expand_one_line_control(line: str) -> list[str]:
+    parsed = parse_one_line_control(line)
+    if parsed is None:
+        return [line]
+    indent, head, tail = parsed
+    if not tail:
+        return [f"{indent}{head} {{"]
+    if tail.startswith("{"):
+        return [line]
+    return [f"{indent}{head} {{", f"{indent}{INDENT}{tail}", f"{indent}}}"]
+
+
+def parse_one_line_control(line: str) -> tuple[str, str, str] | None:
+    match = re.match(r"^(\s*)((?:if|while|for)\s*)\(", line)
+    if not match:
+        return None
+    indent = match.group(1)
+    start = line.find("(", match.start(2))
+    end = find_matching_char(line, start, "(", ")")
+    if end < 0:
+        return None
+    head = line[len(indent) : end + 1].strip()
+    tail = line[end + 1 :].strip()
+    return indent, head, tail
+
+
+def find_matching_char(text: str, start: int, open_ch: str, close_ch: str) -> int:
+    depth = 0
+    quote = ""
+    for i in range(start, len(text)):
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in {"'", '"'}:
+            quote = ch
+            continue
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def is_open_control_line(line: str) -> bool:
+    parsed = parse_one_line_control(line)
+    return parsed is not None and parsed[2] in {"", "{"}
 
 
 def remove_unused_numpy_import(python: str) -> str:
