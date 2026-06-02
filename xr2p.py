@@ -468,7 +468,18 @@ def source_py(path):
     import inspect
     from pathlib import Path as _Path
     py_path = str(path)
+    frame = inspect.currentframe()
+    caller_frame = frame.f_back if frame is not None else None
     here = _Path(__file__).resolve().parent
+    while caller_frame is not None:
+        caller_file = caller_frame.f_globals.get("__file__")
+        if caller_file:
+            try:
+                here = _Path(caller_file).resolve().parent
+                break
+            except Exception:
+                pass
+        caller_frame = caller_frame.f_back
     marker = "/r_src/"
     if marker in py_path.replace("\\\\", "/"):
         tail = py_path.replace("\\\\", "/").split(marker, 1)[1]
@@ -483,30 +494,48 @@ def source_py(path):
     if py_path.lower().endswith((".r", ".R")):
         py_path = py_path[:-2] + ".py"
     try:
-        namespace = runpy.run_path(py_path)
         frame = inspect.currentframe()
-        while frame is not None:
-            frame.f_globals.update(namespace)
-            frame = frame.f_back
+        scopes = []
+        scope = frame.f_back if frame is not None else None
+        while scope is not None:
+            scopes.append(scope.f_globals)
+            scope = scope.f_back
+        init_namespace = scopes[0] if scopes else globals()
+        before_namespace = dict(init_namespace)
+        namespace = runpy.run_path(py_path, init_globals=init_namespace)
+        for scope_globals in scopes:
+            for key, value in namespace.items():
+                if not key.startswith("__"):
+                    scope_globals[key] = value
+        new_keys = [
+            key
+            for key, value in namespace.items()
+            if callable(value)
+            and hasattr(value, "__globals__")
+            and not key.startswith("__")
+            and (key not in before_namespace or before_namespace[key] is not value)
+        ]
         try:
             import __main__ as _main
-            main_vars = vars(_main)
-            for key, value in list(namespace.items()):
+            for key in new_keys:
+                value = namespace[key]
                 if callable(value) and hasattr(value, "__globals__") and not key.startswith("__"):
                     def _wrap_source_func(*args, __func=value, **kwargs):
+                        for scope_globals in scopes:
+                            __func.__globals__.update(scope_globals)
                         __func.__globals__.update(vars(_main))
                         return __func(*args, **kwargs)
                     _wrap_source_func.__name__ = getattr(value, "__name__", key)
                     namespace[key] = _wrap_source_func
         except Exception:
             pass
-        globals().update(namespace)
         try:
             import __main__ as _main
             main_vars = vars(_main)
-            main_vars.update(namespace)
             for value in namespace.values():
                 if callable(value) and hasattr(value, "__globals__"):
+                    for scope_globals in scopes:
+                        value.__globals__.update(scope_globals)
                     value.__globals__.update(main_vars)
         except Exception:
             pass
@@ -2556,6 +2585,10 @@ def translate_statement(line: str) -> list[str]:
     if super_assign_pos >= 0:
         lhs = line[:super_assign_pos].strip()
         rhs = line[super_assign_pos + 3 :].strip()
+        attr_match = re.match(r"^attr\s*\(\s*([A-Za-z]\w*)\s*,\s*(.+)\s*\)$", lhs, re.IGNORECASE)
+        if attr_match:
+            obj, attr_name = attr_match.groups()
+            return [f"r_set_attr({r_name(obj)}, {translate_expr(attr_name)}, {translate_expr(rhs)})"]
         if re.match(r"^[A-Za-z.]\w*$", lhs):
             py_lhs = r_name(lhs)
             return [f"__R_NONLOCAL_ASSIGN__ {py_lhs}", f"{py_lhs} = {translate_expr(rhs)}"]
@@ -3131,6 +3164,8 @@ def replace_double_subscript(match: re.Match[str]) -> str:
 def replace_single_subscript(match: re.Match[str]) -> str:
     base = match.group(1)
     index = match.group(2).strip()
+    if base.endswith(".shape") and re.fullmatch(r"\d+", index):
+        return f"{base}[{index}]"
     if has_top_level_comma(index) and any_negative_matrix_subscript(index):
         return replace_negative_matrix_subscript(base, index)
     if has_top_level_comma(index):
