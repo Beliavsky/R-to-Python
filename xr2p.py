@@ -2092,7 +2092,11 @@ def cbind_py(*cols):
 def rbind_py(*rows):
     if any(isinstance(row, pd.DataFrame) for row in rows):
         return pd.concat(rows, axis=0, ignore_index=True)
-    return np.vstack([np.ravel(row) for row in rows])
+    arrays = []
+    for row in rows:
+        arr = np.asarray(row)
+        arrays.append(arr.reshape((1, -1)) if arr.ndim == 1 else arr)
+    return np.vstack(arrays)
 """.strip()
         )
     if "try_(" in python or "TryError" in python:
@@ -4642,10 +4646,10 @@ def translate_array_call(args: list[str]) -> str:
 def translate_seq_call(args: list[str]) -> str:
     if not args:
         raise R2PyError("seq requires arguments")
-    by = keyword_arg(args, "by")
+    positional = [arg for arg in args if "=" not in arg]
+    by = keyword_arg(args, "by", default=positional[2] if len(positional) > 2 else None)
     length_out = keyword_arg(args, "length.out")
     along_with = keyword_arg(args, "along.with")
-    positional = [arg for arg in args if "=" not in arg]
     if along_with is not None:
         return f"np.arange(1, len({translate_expr(along_with)}) + 1)"
     if length_out is not None:
