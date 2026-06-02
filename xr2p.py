@@ -2300,6 +2300,7 @@ def add_pass_to_empty_blocks(python: str) -> str:
 
 
 def repair_generated_syntax_cleanup(python: str) -> str:
+    python = re.sub(r"\br_print\(([^()\n]*?),\s*end=([^)]+)\)", r"print(\1, end=\2)", python)
     lines = python.splitlines()
     out: list[str] = []
     block_depth = 0
