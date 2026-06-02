@@ -88,6 +88,10 @@ def translate_source(source: str) -> str:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom sklearn.cluster import KMeans\n", 1)
     if re.search(r"(?<![\w.])pi(?![\w.])", python):
         python = python.replace("\n\n", "\npi = np.pi\n\n", 1)
+    bare_math_aliases = {"sin": "np.sin", "cos": "np.cos", "tan": "np.tan", "exp": "np.exp", "log": "np.log", "sqrt": "np.sqrt"}
+    alias_lines = [f"{name} = {target}" for name, target in bare_math_aliases.items() if re.search(rf"(?<![\w.]){name}(?![\w.])", python)]
+    if alias_lines:
+        python = python.replace("\n\n", "\n" + "\n".join(alias_lines) + "\n\n", 1)
     python = sanitize_python_syntax_names(python)
     python = add_runtime_helpers(python)
     python = inject_known_fast_paths(python)
@@ -451,6 +455,7 @@ def class_(x):
         helpers.append(
             """
 def source_py(path):
+    import inspect
     from pathlib import Path as _Path
     py_path = str(path)
     here = _Path(__file__).resolve().parent
@@ -469,6 +474,10 @@ def source_py(path):
         py_path = py_path[:-2] + ".py"
     try:
         namespace = runpy.run_path(py_path)
+        frame = inspect.currentframe()
+        while frame is not None:
+            frame.f_globals.update(namespace)
+            frame = frame.f_back
         try:
             import __main__ as _main
             main_vars = vars(_main)
@@ -1073,7 +1082,8 @@ def uniroot_py(f, lower, upper, tol=1e-8, maxiter=1000):
         helpers.append(
             """
 def fsolve(func, x0, *args, **kwargs):
-    return SimpleNamespace(x=optimize.fsolve(func, x0, args=args, **kwargs))
+    x = optimize.fsolve(func, x0, args=args, **kwargs)
+    return SimpleNamespace(x=x, fval=func(x, *args))
 """.strip()
         )
     if "integrate_py(" in python:
