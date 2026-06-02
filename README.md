@@ -160,20 +160,23 @@ the hard pytest contract.
 Fixture scripts live in `fixtures/`.  Generated `x*.py` outputs are ignored by
 Git; regenerate them locally when needed.
 
-## Batch corpus check
+## Batch checks
 
-If `c:\python\R-to-Fortran` is present, run a sweep over the reusable examples
-from that project:
+`xr2p_batch.py` can run translation sweeps over user-provided R files or glob
+patterns:
 
 ```bat
-python xr2p_batch.py --xr2f-pytest-corpus --quiet
+python xr2p_batch.py fixtures\*.r --quiet
 ```
 
 Add syntax checking:
 
 ```bat
-python xr2p_batch.py --xr2f-pytest-corpus --quiet --check-syntax
+python xr2p_batch.py fixtures\*.r --quiet --check-syntax
 ```
+
+The `--xr2f-pytest-corpus` option is for local development when a separate
+R-to-Fortran checkout is available.
 
 ## Development notes
 
