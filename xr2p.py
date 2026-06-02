@@ -338,6 +338,8 @@ def sanitize_control_head(head: str) -> str:
 
 
 def r_identifier_name(name: str) -> str:
+    if "." in name:
+        DOTTED_R_VARS.add(name)
     out = name.replace(".", "_")
     if keyword.iskeyword(out):
         out += "_"
@@ -2760,11 +2762,11 @@ def parse_for_line(line: str) -> tuple[str, str, str] | None:
     if close < 0:
         return None
     header = line[pos + 1 : close].strip()
-    match = re.match(r"(\w+)\s+in\s+(.+)$", header)
+    match = re.match(r"([A-Za-z_][\w.]*)\s+in\s+(.+)$", header)
     if not match:
         return None
     name, values = match.groups()
-    return name, values.strip(), line[close + 1 :].strip()
+    return r_identifier_name(name), values.strip(), line[close + 1 :].strip()
 
 
 def translate_for_iter(values: str) -> str:
