@@ -88,7 +88,15 @@ def translate_source(source: str) -> str:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom sklearn.cluster import KMeans\n", 1)
     if re.search(r"(?<![\w.])pi(?![\w.])", python):
         python = python.replace("\n\n", "\npi = np.pi\n\n", 1)
-    bare_math_aliases = {"sin": "np.sin", "cos": "np.cos", "tan": "np.tan", "exp": "np.exp", "log": "np.log", "sqrt": "np.sqrt"}
+    bare_math_aliases = {
+        "sin": "np.sin",
+        "cos": "np.cos",
+        "tan": "np.tan",
+        "exp": "np.exp",
+        "log": "np.log",
+        "log10": "np.log10",
+        "sqrt": "np.sqrt",
+    }
     alias_lines = [f"{name} = {target}" for name, target in bare_math_aliases.items() if re.search(rf"(?<![\w.]){name}(?![\w.])", python)]
     if alias_lines:
         python = python.replace("\n\n", "\n" + "\n".join(alias_lines) + "\n\n", 1)
@@ -3596,7 +3604,7 @@ def translate_call(name: str, args: list[str]) -> str:
         return f"np.angle({py_args[0]})"
     if lname == "conj":
         return f"np.conj({py_args[0]})"
-    if lname in {"log", "exp", "sin", "cos", "tan", "abs", "floor"}:
+    if lname in {"log", "log10", "exp", "sin", "cos", "tan", "abs", "floor"}:
         return f"np.{lname}(" + ", ".join(py_args) + ")"
     if lname == "linspace":
         return "np.linspace(" + ", ".join(py_args) + ")"
