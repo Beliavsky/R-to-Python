@@ -4257,8 +4257,7 @@ def translate_read_table_call(args: list[str]) -> str:
     sep = keyword_arg(args, "sep")
     sep_arg = "r'\\s+'" if sep is None or string_literal_value(sep.strip()) == "" else translate_expr(sep)
     header_arg = "0" if header == "True" else "None"
-    names_arg = "" if header == "True" else ", header=None"
-    return f"pd.read_csv({file_arg}, sep={sep_arg}, header={header_arg}{names_arg})"
+    return f"pd.read_csv({file_arg}, sep={sep_arg}, header={header_arg})"
 
 
 def translate_write_lines_call(args: list[str]) -> str:
