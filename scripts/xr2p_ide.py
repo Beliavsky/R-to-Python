@@ -126,6 +126,7 @@ class Xr2pIde:
         self.round_var = tk.StringVar(value="")
         self.pretty_var = tk.BooleanVar(value=True)
         self.no_compile_var = tk.BooleanVar(value=False)
+        self.autocomplete_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="Ready")
         self.elapsed_r_var = tk.StringVar(value="R: ")
         self.elapsed_py_var = tk.StringVar(value="Python: ")
@@ -156,6 +157,7 @@ class Xr2pIde:
         ttk.Entry(toolbar, width=5, textvariable=self.round_var).pack(side=tk.LEFT, padx=(2, 8))
         ttk.Checkbutton(toolbar, text="Pretty R", variable=self.pretty_var).pack(side=tk.LEFT)
         ttk.Checkbutton(toolbar, text="No compile", variable=self.no_compile_var).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Checkbutton(toolbar, text="Autocomplete", variable=self.autocomplete_var).pack(side=tk.LEFT, padx=(4, 0))
 
         pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         pane.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
@@ -199,6 +201,7 @@ class Xr2pIde:
         self.configure_syntax_tags(self.py_text)
         self.r_text.bind("<<Modified>>", lambda _event: self.on_text_modified(self.r_text, "r"))
         self.py_text.bind("<<Modified>>", lambda _event: self.on_text_modified(self.py_text, "python"))
+        self.r_text.bind("<KeyPress>", self.r_autocomplete)
 
     def text_widget(self, parent: tk.Widget, *, height: int | None = None) -> tk.Text:
         frame = ttk.Frame(parent)
@@ -284,6 +287,49 @@ class Xr2pIde:
             return
         widget.edit_modified(False)
         self.highlight(widget, language)
+
+    def r_autocomplete(self, event: tk.Event) -> str | None:
+        if not self.autocomplete_var.get():
+            return None
+        char = event.char
+        if not char:
+            return None
+        pairs = {"(": ")", "{": "}", "[": "]", '"': '"', "'": "'"}
+        closing = {")", "}", "]"}
+        text = self.r_text
+        if char in pairs:
+            if char in {'"', "'"} and self.next_char() == char:
+                text.mark_set("insert", "insert+1c")
+                return "break"
+            text.insert("insert", char + pairs[char])
+            text.mark_set("insert", "insert-1c")
+            return "break"
+        if char in closing and self.next_char() == char:
+            text.mark_set("insert", "insert+1c")
+            return "break"
+        if char in {"\r", "\n"}:
+            return self.r_auto_newline()
+        return None
+
+    def next_char(self) -> str:
+        return self.r_text.get("insert", "insert+1c")
+
+    def r_auto_newline(self) -> str | None:
+        text = self.r_text
+        line = text.get("insert linestart", "insert")
+        indent = line[: len(line) - len(line.lstrip(" \t"))]
+        before = text.get("insert-1c", "insert")
+        after = text.get("insert", "insert+1c")
+        if before == "{" and after == "}":
+            inner = indent + "    "
+            text.insert("insert", "\n" + inner + "\n" + indent)
+            text.mark_set("insert", "insert-1l lineend")
+            return "break"
+        if line.rstrip().endswith("{"):
+            text.insert("insert", "\n" + indent + "    ")
+            return "break"
+        text.insert("insert", "\n" + indent)
+        return "break"
 
     def highlight(self, widget: tk.Text, language: str) -> None:
         for tag in ("keyword", "builtin", "string", "number", "comment"):
