@@ -10,7 +10,7 @@ env/
 
 # Generated transpiler outputs in the repository root.
 # Keep the actual project sources.
-x*.py
+/x*.py
 !xr2p.py
 !xr2p_batch.py
 

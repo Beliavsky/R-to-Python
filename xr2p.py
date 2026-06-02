@@ -91,7 +91,7 @@ def translate_source(source: str) -> str:
     python = inject_known_fast_paths(python)
     if "SimpleNamespace" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom types import SimpleNamespace\n", 1)
-    if "pd." in python or "lm_py(" in python or "stack_py(" in python or "unstack_py(" in python or "r_with(" in python or "r_within(" in python or "r_member(" in python or "r_vec_subset(" in python or "r_matrix_index_get(" in python or "r_matrix_index_set(" in python or "r_subset(" in python or "r_set_subset(" in python or "r_subset_df(" in python or "r_df_col(" in python or "r_data_frame(" in python or "r_model_matrix(" in python:
+    if "pd." in python or "lm_py(" in python or "stack_py(" in python or "unstack_py(" in python or "r_with(" in python or "r_within(" in python or "r_member(" in python or "r_vec_subset(" in python or "r_matrix_index_get(" in python or "r_matrix_index_set(" in python or "r_subset(" in python or "r_set_subset(" in python or "r_subset_df(" in python or "r_df_col(" in python or "r_data_frame(" in python or "r_model_matrix(" in python or "tribble_py(" in python or "add_row_py(" in python or "add_column_py(" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nimport pandas as pd\n", 1)
     if "tempfile." in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nimport tempfile\n", 1)
@@ -426,6 +426,19 @@ def r_is_vector(x):
 
 def r_is_matrix(x):
     return isinstance(x, np.ndarray) and x.ndim == 2
+""".strip()
+        )
+    if "class_(" in python:
+        helpers.append(
+            """
+def class_(x):
+    if isinstance(x, pd.DataFrame):
+        return np.array(["data.frame"])
+    if isinstance(x, pd.Series):
+        return np.array([str(x.dtype)])
+    if isinstance(x, np.ndarray):
+        return np.array([str(x.dtype)])
+    return np.array([type(x).__name__])
 """.strip()
         )
     if "r_length(" in python or "r_set_length(" in python:
@@ -1123,6 +1136,14 @@ def r_vec_subset(x, key):
         helpers.append(
             """
 def r_matrix_index_get(x, idx):
+    if isinstance(x, pd.DataFrame):
+        if isinstance(idx, str):
+            return x[[idx]]
+        arr_idx = np.asarray(idx)
+        if arr_idx.dtype.kind in {"U", "S", "O"}:
+            cols = arr_idx.tolist() if arr_idx.ndim else [str(arr_idx.item())]
+            return x[cols]
+        return x.iloc[np.asarray(idx, dtype=int) - 1]
     arr = np.asarray(idx)
     if np.asarray(x).ndim == 2 and arr.ndim == 2 and arr.shape[1] == 2:
         return x[arr[:, 0].astype(int) - 1, arr[:, 1].astype(int) - 1]
@@ -1145,6 +1166,13 @@ def r_subset(x, *keys):
     if isinstance(x, pd.DataFrame):
         if len(keys) == 1:
             key = keys[0]
+            if isinstance(key, tuple) and len(key) == 2:
+                row_key, col_key = key
+                if isinstance(row_key, tuple) and len(row_key) == 2 and np.asarray(row_key[1]).shape[1:] == (1,):
+                    row_key = np.asarray(row_key[0]).ravel()
+                if isinstance(col_key, tuple) and len(col_key) == 2 and np.asarray(col_key[0]).shape[:1] == (1,):
+                    col_key = np.asarray(col_key[1]).ravel()
+                return r_subset(x, row_key, col_key)
             if isinstance(key, str):
                 return x[key]
             return x.iloc[key]
@@ -1156,8 +1184,12 @@ def r_subset(x, *keys):
             isinstance(row_key, (list, tuple, np.ndarray)) and np.asarray(row_key).dtype == bool
         )
         int_rows = isinstance(row_key, (list, tuple, np.ndarray)) and np.asarray(row_key).dtype.kind in {"i", "u"}
+        if int_rows:
+            row_key = np.asarray(row_key).ravel()
         if string_cols:
             cols = col_key.tolist() if isinstance(col_key, np.ndarray) else col_key
+            if isinstance(cols, list) and cols and isinstance(cols[0], list):
+                cols = np.asarray(cols).ravel().tolist()
             if isinstance(row_key, slice) or bool_rows:
                 return x.loc[row_key, cols]
             if int_rows:
@@ -1253,7 +1285,7 @@ def r_rank(x):
     return ranks
 """.strip()
         )
-    if "r_factor(" in python or "r_levels(" in python or "r_table(" in python or "r_tapply(" in python or "cut_py(" in python or "r_model_matrix(" in python or "r_df_col(" in python or "r_data_frame(" in python:
+    if "r_factor(" in python or "r_levels(" in python or "r_table(" in python or "r_tapply(" in python or "cut_py(" in python or "r_model_matrix(" in python or "r_df_col(" in python or "r_data_frame(" in python or "tribble_py(" in python or "add_row_py(" in python or "add_column_py(" in python:
         helpers.append(
             """
 class RFactor:
@@ -1347,6 +1379,40 @@ def r_df_col(x):
 
 def r_data_frame(**kwargs):
     return pd.DataFrame({name: r_df_col(value) for name, value in kwargs.items()})
+
+
+def r_tibble_frame(pairs):
+    out = {}
+    for name, value in pairs:
+        col = r_df_col(value)
+        if np.isscalar(col) or isinstance(col, str):
+            col = [col]
+        out[name] = col
+    return pd.DataFrame(out)
+
+
+def tribble_py(names, rows):
+    return pd.DataFrame([dict(zip(names, row)) for row in rows])
+
+
+def add_row_py(df, **kwargs):
+    return pd.concat([df, pd.DataFrame([kwargs])], ignore_index=True)
+
+
+def add_column_py(df, **kwargs):
+    out = df.copy()
+    after = kwargs.pop("_after", None)
+    before = kwargs.pop("_before", None)
+    for name, value in kwargs.items():
+        out[name] = r_df_col(value)
+        col = out.pop(name)
+        if after is not None and after in out.columns:
+            out.insert(list(out.columns).index(after) + 1, name, col)
+        elif before is not None and before in out.columns:
+            out.insert(list(out.columns).index(before), name, col)
+        else:
+            out[name] = col
+    return out
 
 
 def r_model_matrix(data, response, terms):
@@ -2342,6 +2408,9 @@ def translate_statement(line: str) -> list[str]:
     assign = split_assignment(line)
     if assign is not None:
         lhs, rhs = assign
+        tibble_call = parse_full_call(rhs)
+        if tibble_call is not None and tibble_call[0].lower() in {"tibble", "tibble_row"} and re.match(r"^[A-Za-z]\w*$", lhs):
+            return translate_tibble_assignment(r_name(lhs), tibble_call[1])
         py_rhs = translate_expr(rhs)
         double_subscript_assign = re.match(r"^([A-Za-z]\w*)\[\[(.*)\]\]$", lhs)
         if double_subscript_assign:
@@ -2636,6 +2705,7 @@ def translate_expr_code(expr: str) -> str:
     expr = expr.replace("<-", "=")
     expr = re.sub(r"(?<=\d)[lL]\b", "", expr)
     expr = replace_in_operator(expr)
+    expr = replace_backtick_member_access(expr)
     expr = expr.replace("$", "@@MEM@@")
     expr = expr.replace("%%", "%")
     expr = expr.replace("%*%", "@")
@@ -2657,6 +2727,14 @@ def translate_expr_code(expr: str) -> str:
     expr = apply_recycled_binops(expr)
     expr = expr.replace("@@MEM@@", ".")
     return expr
+
+
+def replace_backtick_member_access(expr: str) -> str:
+    return re.sub(
+        r"\b([A-Za-z]\w*)\$`([^`]+)`",
+        lambda m: f"{r_name(m.group(1))}[{m.group(2)!r}]",
+        expr,
+    )
 
 
 def replace_in_operator(expr: str) -> str:
@@ -3230,6 +3308,18 @@ def translate_call(name: str, args: list[str]) -> str:
         return translate_list_call(args)
     if lname == "data.frame":
         return translate_data_frame_call(args)
+    if lname in {"tibble", "tibble_row"}:
+        return translate_tibble_call(args)
+    if lname in {"as_tibble", "as.tibble", "as.data.frame"}:
+        return f"pd.DataFrame({py_args[0]})"
+    if lname in {"is_tibble", "is.tibble"}:
+        return f"isinstance({py_args[0]}, pd.DataFrame)"
+    if lname == "tribble":
+        return translate_tribble_call(args)
+    if lname == "add_row":
+        return translate_add_row_call(args)
+    if lname == "add_column":
+        return translate_add_column_call(args)
     if lname == "factor":
         levels = keyword_arg(args, "levels")
         ordered = translate_expr(keyword_arg(args, "ordered", default="False"))
@@ -3534,6 +3624,8 @@ def translate_call(name: str, args: list[str]) -> str:
         return py_args[0] + ".fitted"
     if lname == "summary":
         return "summary_py(" + py_args[0] + ")"
+    if lname == "class":
+        return "class_(" + py_args[0] + ")"
     if lname == "length":
         return "r_length(" + py_args[0] + ")"
     if lname == "names":
@@ -3758,6 +3850,99 @@ def translate_data_frame_call(args: list[str]) -> str:
                 name = f"x{unnamed}"
         fields.append(f"{name}={value}")
     return "r_data_frame(" + ", ".join(fields) + ")"
+
+
+def translate_tibble_call(args: list[str]) -> str:
+    items: list[str] = []
+    unnamed = 0
+    for arg in args:
+        pos = find_top_level_operator(arg, "=")
+        if pos >= 0:
+            name = r_column_name(arg[:pos].strip())
+            raw_value = arg[pos + 1 :].strip()
+        else:
+            raw_value = arg
+            value = translate_expr(arg)
+            if re.match(r"^[A-Za-z_]\w*$", value):
+                name = value
+            else:
+                unnamed += 1
+                name = f"x{unnamed}"
+        py_value = translate_expr(raw_value)
+        items.append(f"({name!r}, {py_value})")
+    return "r_tibble_frame([" + ", ".join(items) + "])"
+
+
+def translate_tibble_assignment(lhs: str, args: list[str]) -> list[str]:
+    out: list[str] = []
+    pairs: list[str] = []
+    prior: dict[str, str] = {}
+    unnamed = 0
+    for arg in args:
+        pos = find_top_level_operator(arg, "=")
+        if pos >= 0:
+            raw_name = arg[:pos].strip()
+            col_name = r_column_name(raw_name)
+            safe_name = r_name(raw_name)
+            raw_value = arg[pos + 1 :].strip()
+        else:
+            raw_value = arg
+            unnamed += 1
+            col_name = f"x{unnamed}"
+            safe_name = col_name
+        temp = f"__{lhs}_{safe_name}"
+        value = translate_expr(raw_value)
+        value = replace_prior_tibble_names(value, prior)
+        out.append(f"{temp} = {value}")
+        pairs.append(f"({col_name!r}, {temp})")
+        prior[safe_name] = temp
+    out.append(f"{lhs} = r_tibble_frame([" + ", ".join(pairs) + "])")
+    return out
+
+
+def replace_prior_tibble_names(expr: str, names: dict[str, str]) -> str:
+    for name, temp in names.items():
+        expr = re.sub(rf"\b{re.escape(name)}\b", temp, expr)
+    return expr
+
+
+def r_column_name(name: str) -> str:
+    stripped = name.strip()
+    if len(stripped) >= 2 and stripped[0] == "`" and stripped[-1] == "`":
+        return stripped[1:-1]
+    return r_name(stripped)
+
+
+def translate_tribble_call(args: list[str]) -> str:
+    names: list[str] = []
+    rows: list[list[str]] = []
+    values: list[str] = []
+    for arg in args:
+        stripped = arg.strip()
+        if stripped.startswith("~"):
+            names.append(r_name(stripped[1:].strip()))
+        else:
+            values.append(translate_expr(arg))
+    if names:
+        width = len(names)
+        rows = [values[i : i + width] for i in range(0, len(values), width)]
+    return "tribble_py(" + repr(names) + ", [" + ", ".join("[" + ", ".join(row) + "]" for row in rows) + "])"
+
+
+def translate_add_row_call(args: list[str]) -> str:
+    if not args:
+        raise R2PyError("add_row requires a data frame")
+    data = translate_expr(args[0])
+    fields = [translate_call_arg(arg) for arg in args[1:]]
+    return f"add_row_py({data}" + (", " + ", ".join(fields) if fields else "") + ")"
+
+
+def translate_add_column_call(args: list[str]) -> str:
+    if not args:
+        raise R2PyError("add_column requires a data frame")
+    data = translate_expr(args[0])
+    fields = [translate_call_arg(arg) for arg in args[1:]]
+    return f"add_column_py({data}" + (", " + ", ".join(fields) if fields else "") + ")"
 
 
 def translate_model_matrix_call(args: list[str]) -> str:
@@ -4491,7 +4676,12 @@ def translate_call_arg(arg: str) -> str:
 
 
 def normalize_keyword_name(name: str) -> str:
-    out = r_name(name.strip().replace(".", "_"))
+    stripped = name.strip()
+    if stripped == ".after":
+        return "_after"
+    if stripped == ".before":
+        return "_before"
+    out = r_name(stripped.replace(".", "_"))
     if out == "lambda":
         return "lambda_"
     return out
@@ -4558,12 +4748,16 @@ def apply_recycled_binops(expr: str) -> str:
 def r_name(name: str) -> str:
     if not name:
         return name
+    if len(name) >= 2 and name[0] == "`" and name[-1] == "`":
+        name = name[1:-1]
     constants = {"True", "False", "None", "np", "pd", "stats", "nan", "inf", "and", "or", "not", "is", "in", "if", "else", "for"}
     if name in constants or "." in name or name.startswith("np.") or name.startswith("stats."):
         return name
     if name[0].isdigit():
         return name
-    out = name.replace(".", "_")
+    out = re.sub(r"\W+", "_", name.replace(".", "_")).strip("_")
+    if not out:
+        out = "x"
     if keyword.iskeyword(out):
         out += "_"
     return out

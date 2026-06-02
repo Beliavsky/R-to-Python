@@ -52,6 +52,12 @@ Print the generated Python while writing it:
 python xr2p.py fixtures\xseq.r --tee
 ```
 
+Print both the original R source and generated Python:
+
+```bat
+python xr2p.py fixtures\xseq.r --tee-both
+```
+
 Skip Python syntax checking:
 
 ```bat
@@ -90,6 +96,25 @@ Round numeric output before comparison:
 ```bat
 python xr2p.py fixtures\xseq.r --run-diff --round-both 6
 ```
+
+## Optional GUI
+
+A small Tkinter GUI is available:
+
+```bat
+python scripts\xr2p_ide.py
+```
+
+Open an R file directly:
+
+```bat
+python scripts\xr2p_ide.py fixtures\xseq.r
+```
+
+The GUI is a thin wrapper around `xr2p.py`.  It provides R source and generated
+Python panes, syntax highlighting, optional autocomplete, adjustable font size,
+timing displays for R and Python runs, and buttons for translate, run Python,
+run both R/Python, and diff.
 
 ## Supported feature areas
 
@@ -175,8 +200,25 @@ Add syntax checking:
 python xr2p_batch.py fixtures\*.r --quiet --check-syntax
 ```
 
+Run recursively over a downloaded corpus and save generated Python plus a CSV
+summary:
+
+```bat
+python xr2p_batch.py c:\rcode\public_domain\burkardt --recursive --check-syntax --out-dir c:\temp\xr2p_burkardt --summary-csv c:\temp\xr2p_burkardt\summary.csv --quiet
+```
+
+Process only the first few expanded inputs while testing a large corpus:
+
+```bat
+python xr2p_batch.py c:\rcode\public_domain\burkardt --recursive --limit 25 --check-syntax --quiet
+```
+
 The `--xr2f-pytest-corpus` option is for local development when a separate
 R-to-Fortran checkout is available.
+
+Failure output includes the generated Python line, nearby generated context,
+and source file path.  Batch runs also print the finish time and elapsed
+seconds.
 
 ## Development notes
 

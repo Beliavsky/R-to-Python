@@ -35,8 +35,16 @@ def test_matrix_size_expression_preserves_precedence():
 
 def test_one_line_for_translation():
     out = translate_source("for (i in 1:3) print(sqrt(i))\n")
-    assert "for i in r_range(1, 3):" in out
+    assert "for i in range(1, 4):" in out
     assert "r_s3_print(np.sqrt(i))" in out
+
+
+def test_simple_cat_newline_loop_omits_numpy_import_and_end_argument():
+    out = translate_source('for (i in 1:3) {\n  cat(i, i^2, "\\n")\n}\n')
+    assert not out.startswith("import numpy as np")
+    assert "for i in range(1, 4):" in out
+    assert "print(i, i ** 2)" in out
+    assert 'end=""' not in out
 
 
 def test_unused_for_counter_uses_zero_based_arange():
@@ -46,7 +54,7 @@ def test_unused_for_counter_uses_zero_based_arange():
         "  print(mean(x))\n"
         "}\n"
     )
-    assert "for i in np.arange(3):" in out
+    assert "for i in range(1, 4):" in out
     assert "r_seq(1, 3)" not in out
 
 
@@ -97,6 +105,25 @@ def test_tee_option_prints_generated_python(tmp_path: Path):
     assert "import numpy as np" in proc.stdout
     assert "x = 3" in proc.stdout
     assert "print(x)" in proc.stdout
+
+
+def test_tee_both_option_prints_source_and_generated_python(tmp_path: Path):
+    source = tmp_path / "x.r"
+    out = tmp_path / "x.py"
+    source.write_text("x <- 3\nprint(x)\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "xr2p.py"), str(source), "-o", str(out), "--tee-both"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "R source:" in proc.stdout
+    assert "x <- 3" in proc.stdout
+    assert "Python translation:" in proc.stdout
+    assert "x = 3" in proc.stdout
 
 
 def test_cli_checks_generated_python_by_default(tmp_path: Path):
@@ -193,6 +220,22 @@ def test_range_endpoint_can_be_function_call():
 def test_range_endpoint_can_be_member_access():
     out = translate_source("for (i in 1:fit$p) print(i)\n")
     assert "for i in r_range(1, fit.p):" in out
+
+
+def test_simple_symbol_stop_for_loop_uses_python_range():
+    out = translate_source("for (i in 1:n) print(i)\n")
+    assert "for i in range(1, n + 1):" in out
+
+
+def test_floor_maps_to_numpy():
+    out = translate_source("for (i in 2:floor(sqrt(n))) print(i)\n")
+    assert "np.floor(np.sqrt(n))" in out
+    assert " floor(" not in out
+
+
+def test_unknown_direction_for_loop_keeps_r_range():
+    out = translate_source("for (i in a:b) print(i)\n")
+    assert "for i in r_range(a, b):" in out
 
 
 def test_data_frame_with_mixed_named_and_unnamed_args():

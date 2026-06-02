@@ -124,6 +124,7 @@ class Xr2pIde:
 
         self.timeout_var = tk.StringVar(value="30")
         self.round_var = tk.StringVar(value="")
+        self.font_size_var = tk.IntVar(value=12)
         self.pretty_var = tk.BooleanVar(value=True)
         self.no_compile_var = tk.BooleanVar(value=False)
         self.autocomplete_var = tk.BooleanVar(value=True)
@@ -131,6 +132,7 @@ class Xr2pIde:
         self.elapsed_r_var = tk.StringVar(value="R: ")
         self.elapsed_py_var = tk.StringVar(value="Python: ")
         self.output_mode = "single"
+        self.text_widgets: list[tk.Text] = []
 
         self.build_ui()
         if source is not None:
@@ -155,6 +157,11 @@ class Xr2pIde:
         ttk.Entry(toolbar, width=5, textvariable=self.timeout_var).pack(side=tk.LEFT, padx=(2, 8))
         ttk.Label(toolbar, text="Round").pack(side=tk.LEFT)
         ttk.Entry(toolbar, width=5, textvariable=self.round_var).pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Label(toolbar, text="Font").pack(side=tk.LEFT)
+        font_spin = ttk.Spinbox(toolbar, from_=8, to=24, width=4, textvariable=self.font_size_var, command=self.update_text_fonts)
+        font_spin.pack(side=tk.LEFT, padx=(2, 8))
+        font_spin.bind("<Return>", lambda _event: self.update_text_fonts())
+        font_spin.bind("<FocusOut>", lambda _event: self.update_text_fonts())
         ttk.Checkbutton(toolbar, text="Pretty R", variable=self.pretty_var).pack(side=tk.LEFT)
         ttk.Checkbutton(toolbar, text="No compile", variable=self.no_compile_var).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Checkbutton(toolbar, text="Autocomplete", variable=self.autocomplete_var).pack(side=tk.LEFT, padx=(4, 0))
@@ -215,8 +222,9 @@ class Xr2pIde:
             height=height,
             yscrollcommand=yscroll.set,
             xscrollcommand=xscroll.set,
-            font=("Consolas", 10),
+            font=("Consolas", self.font_size_var.get()),
         )
+        self.text_widgets.append(text)
         yscroll.configure(command=text.yview)
         xscroll.configure(command=text.xview)
         text.grid(row=0, column=0, sticky="nsew")
@@ -226,6 +234,16 @@ class Xr2pIde:
         frame.columnconfigure(0, weight=1)
         frame.text = text  # type: ignore[attr-defined]
         return frame.text  # type: ignore[attr-defined]
+
+    def update_text_fonts(self) -> None:
+        try:
+            size = int(self.font_size_var.get())
+        except (TypeError, tk.TclError, ValueError):
+            size = 12
+        size = max(8, min(size, 24))
+        self.font_size_var.set(size)
+        for widget in self.text_widgets:
+            widget.configure(font=("Consolas", size))
 
     def timeout(self) -> float | None:
         raw = self.timeout_var.get().strip()
@@ -464,11 +482,13 @@ class Xr2pIde:
             if result.stderr:
                 self.py_output_text.insert(tk.END, ("\n" if py_text else "") + result.stderr)
         else:
-            self.append_output("$ " + " ".join(str(part) for part in result.command))
-            if result.stdout:
-                self.append_output(result.stdout)
-            if result.stderr:
-                self.append_output(result.stderr)
+            if ide_result.run_mode is not None or result.returncode != 0:
+                if result.returncode != 0:
+                    self.append_output("$ " + " ".join(str(part) for part in result.command))
+                if result.stdout and not (ide_result.run_mode is None and result.stdout.strip().startswith("wrote ")):
+                    self.append_output(result.stdout)
+                if result.stderr:
+                    self.append_output(result.stderr)
             if ide_result.run_mode == "run":
                 self.elapsed_py_var.set(f"Python: {result.elapsed:.3f}s")
         state = "OK" if result.returncode == 0 else f"exit={result.returncode}"
