@@ -1262,7 +1262,14 @@ def r_matrix_index_set(x, idx, value):
         vals = np.resize(np.asarray(value), arr.shape[0])
         x[arr[:, 0].astype(int) - 1, arr[:, 1].astype(int) - 1] = vals
         return x
-    return r_set_subset(x, value, idx)
+    key = np.asarray(idx)
+    if key.dtype == bool:
+        x[key] = value
+    elif key.ndim == 0:
+        x[int(key) - 1] = value
+    else:
+        x[key.astype(int) - 1] = value
+    return x
 """.strip()
         )
     if "r_subset(" in python or "r_set_subset(" in python or "r_subset_df(" in python or "r_with(" in python or "r_within(" in python:
@@ -3809,7 +3816,7 @@ def translate_call(name: str, args: list[str]) -> str:
         return "np.arange(1, len(" + py_args[0] + ") + 1)"
     if lname == "seq_len":
         return "np.arange(1, " + py_args[0] + " + 1)"
-    if lname == "rep":
+    if lname in {"rep", "rep.int", "rep_int"}:
         return translate_rep_call(args)
     if lname == "reduce":
         return "reduce_py(" + ", ".join(py_args) + ")"
