@@ -24,6 +24,7 @@ INDENT = "    "
 USER_FUNCTION_PARAMS: dict[str, list[str]] = {}
 PENDING_FUNCTION_PARAMS: list[str] | None = None
 NAMED_VECTOR_VARS: set[str] = set()
+DOTTED_R_VARS: set[str] = set()
 
 
 @dataclass
@@ -40,6 +41,7 @@ class R2PyError(Exception):
 def translate_source(source: str) -> str:
     USER_FUNCTION_PARAMS.clear()
     NAMED_VECTOR_VARS.clear()
+    DOTTED_R_VARS.clear()
     global PENDING_FUNCTION_PARAMS
     PENDING_FUNCTION_PARAMS = None
     out = ["import numpy as np", ""]
@@ -74,7 +76,7 @@ def translate_source(source: str) -> str:
     python = repair_generated_syntax_cleanup(python)
     if "stats." in python or "aov_py(" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom scipy import stats\n", 1)
-    if "optimize." in python or "uniroot_py(" in python:
+    if "optimize." in python or "uniroot_py(" in python or re.search(r"(?<![\w.])fsolve(?![\w.])", python):
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom scipy import optimize\n", 1)
     if "integrate." in python or "integrate_py(" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom scipy import integrate\n", 1)
@@ -95,6 +97,8 @@ def translate_source(source: str) -> str:
         python = python.replace("import numpy as np\n", "import numpy as np\nimport pandas as pd\n", 1)
     if "tempfile." in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nimport tempfile\n", 1)
+    if "source_py(" in python:
+        python = python.replace("import numpy as np\n", "import numpy as np\nimport runpy\n", 1)
     if "pickle." in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nimport pickle\n", 1)
     if "capture_output_py(" in python:
@@ -107,6 +111,8 @@ def translate_source(source: str) -> str:
         python = python.replace("import numpy as np\n", "import numpy as np\nimport re\n", 1)
     if "Path(" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom pathlib import Path\n", 1)
+    if "time." in python:
+        python = python.replace("import numpy as np\n", "import numpy as np\nimport time\n", 1)
     python = remove_unused_numpy_import(python)
     return python
 
@@ -439,6 +445,44 @@ def class_(x):
     if isinstance(x, np.ndarray):
         return np.array([str(x.dtype)])
     return np.array([type(x).__name__])
+""".strip()
+        )
+    if "source_py(" in python:
+        helpers.append(
+            """
+def source_py(path):
+    from pathlib import Path as _Path
+    py_path = str(path)
+    here = _Path(__file__).resolve().parent
+    marker = "/r_src/"
+    if marker in py_path.replace("\\\\", "/"):
+        tail = py_path.replace("\\\\", "/").split(marker, 1)[1]
+        root = here
+        while root.name.lower() != "r_src" and root != root.parent:
+            root = root.parent
+        py_path = str(root / tail)
+    else:
+        candidate = _Path(py_path)
+        if not candidate.is_absolute():
+            py_path = str(here / candidate)
+    if py_path.lower().endswith((".r", ".R")):
+        py_path = py_path[:-2] + ".py"
+    try:
+        globals().update(runpy.run_path(py_path))
+    except FileNotFoundError:
+        return None
+    return None
+""".strip()
+        )
+    if "match_fun(" in python:
+        helpers.append(
+            """
+def match_fun(f):
+    if callable(f):
+        return f
+    if isinstance(f, str):
+        return globals()[f]
+    return f
 """.strip()
         )
     if "r_length(" in python or "r_set_length(" in python:
@@ -968,6 +1012,13 @@ def uniroot_py(f, lower, upper, tol=1e-8, maxiter=1000):
     result = optimize.root_scalar(f, bracket=[lower, upper], xtol=tol, maxiter=int(maxiter), method="brentq")
     root = result.root
     return SimpleNamespace(root=root, f=SimpleNamespace(root=f(root)), iter=result.iterations)
+""".strip()
+        )
+    if re.search(r"(?<![\w.])fsolve(?![\w.])", python):
+        helpers.append(
+            """
+def fsolve(func, x0, *args, **kwargs):
+    return SimpleNamespace(x=optimize.fsolve(func, x0, args=args, **kwargs))
 """.strip()
         )
     if "integrate_py(" in python:
@@ -1824,7 +1875,7 @@ def var_r(x):
         helpers.append(
             """
 def lm_py(y, x):
-    y = np.asarray(y, dtype=float)
+    y = np.asarray(y, dtype=float).ravel()
     if isinstance(x, pd.DataFrame):
         design = x.to_numpy(dtype=float)
         coef_names = list(x.columns)
@@ -1833,9 +1884,10 @@ def lm_py(y, x):
         design = np.column_stack((np.ones(len(x)), x))
         coef_names = ["(Intercept)", "x"]
     coef, *_ = np.linalg.lstsq(design, y, rcond=None)
+    coef = np.asarray(coef, dtype=float).ravel()
     fitted = design @ coef
     resid = y - fitted
-    return SimpleNamespace(coef=coef, coef_names=coef_names, fitted=fitted, resid=resid)
+    return SimpleNamespace(kind="lm", coef=coef, coef_names=coef_names, fitted=fitted, resid=resid)
 
 def summary_lm_py(fit):
     lines = ["Call: lm_py(y, x)", "", "Coefficients:"]
@@ -1890,11 +1942,14 @@ def summary_aov_py(fit):
     return "\\n".join(lines)
 
 def summary_py(x):
-    if getattr(x, "kind", None) == "aov":
+    if isinstance(x, pd.DataFrame):
+        return x.describe(include="all")
+    kind = getattr(x, "__dict__", {}).get("kind")
+    if kind == "aov":
         return summary_aov_py(x)
-    if getattr(x, "kind", None) == "glm":
+    if kind == "glm":
         return summary_glm_py(x)
-    if hasattr(x, "coef") and hasattr(x, "resid"):
+    if kind == "lm":
         return summary_lm_py(x)
     values = np.asarray(x, dtype=float)
     return RNamedVector(np.array([
@@ -2676,6 +2731,9 @@ def split_assignment(line: str) -> tuple[str, str] | None:
     if assign is not None:
         lhs, rhs = assign
         if re.match(r"^[A-Za-z.]\w*(?:\[.*\])?$", lhs):
+            base_lhs = lhs.split("[", 1)[0]
+            if "." in base_lhs:
+                DOTTED_R_VARS.add(base_lhs)
             return translate_expr(lhs), rhs
     return None
 
@@ -2782,6 +2840,7 @@ def replace_r_constants(expr: str) -> str:
         "Inf": "np.inf",
         ".Machine@@MEM@@double.eps": "np.finfo(float).eps",
         ".Machine@@MEM@@double.xmin": "np.finfo(float).tiny",
+        "version@@MEM@@version.string": repr("Python translation"),
     }
     for old, new in replacements.items():
         if old.startswith("."):
@@ -3099,6 +3158,10 @@ def is_string_literal(text: str) -> bool:
     return len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}
 
 
+def string_literal_value(text: str) -> str:
+    return text[1:-1] if is_string_literal(text) else text
+
+
 def is_newline_literal(text: str) -> bool:
     if not is_string_literal(text):
         return False
@@ -3250,6 +3313,8 @@ def translate_call(name: str, args: list[str]) -> str:
         return translate_write_csv_call(args)
     if lname == "read.csv":
         return translate_read_csv_call(args)
+    if lname in {"read.table", "read_table"}:
+        return translate_read_table_call(args)
     if lname == "saverds":
         data = translate_expr(args[0])
         file_arg = translate_expr(keyword_arg(args, "file", default=args[1] if len(args) > 1 else None))
@@ -3263,6 +3328,8 @@ def translate_call(name: str, args: list[str]) -> str:
         con = translate_expr(args[0])
         return f"np.fromstring(str({con}), sep=' ')"
     if lname == "close":
+        return "None"
+    if lname in {"q", "quit"}:
         return "None"
     if lname == "writelines":
         return translate_write_lines_call(args)
@@ -3297,7 +3364,12 @@ def translate_call(name: str, args: list[str]) -> str:
         return f"prcomp_py({x}, center={center}, scale={scale})"
     call_name = r_function_name(name)
     args = apply_partial_argument_matching(call_name, args)
-    py_args = [translate_expr(arg) for arg in args]
+    py_args: list[str] = []
+    for arg in args:
+        if arg.strip() == "...":
+            py_args.extend(["*args", "**kwargs"])
+        else:
+            py_args.append(translate_expr(arg))
     if name.startswith("np."):
         return name + "(" + ", ".join(py_args) + ")"
     if call_name in USER_FUNCTION_PARAMS and call_name != name:
@@ -3410,6 +3482,8 @@ def translate_call(name: str, args: list[str]) -> str:
         return f"np.conj({py_args[0]})"
     if lname in {"log", "exp", "sin", "cos", "tan", "abs", "floor"}:
         return f"np.{lname}(" + ", ".join(py_args) + ")"
+    if lname == "linspace":
+        return "np.linspace(" + ", ".join(py_args) + ")"
     if lname == "ceiling":
         return "np.ceil(" + ", ".join(py_args) + ")"
     if lname == "trunc":
@@ -3617,7 +3691,7 @@ def translate_call(name: str, args: list[str]) -> str:
         after_arg = "" if after is None else ", after=" + translate_expr(after)
         return "append_py(" + py_args[0] + ", " + py_args[1] + after_arg + ")"
     if lname == "coef":
-        return f"RNamedVector({py_args[0]}.coef, getattr({py_args[0]}, 'coef_names', [str(i) for i in range(len({py_args[0]}.coef))]))"
+        return f"RNamedVector({py_args[0]}@@MEM@@coef, getattr({py_args[0]}, 'coef_names', [str(i) for i in range(len({py_args[0]}@@MEM@@coef))]))"
     if lname in {"residuals", "resid"}:
         return py_args[0] + ".resid"
     if lname == "fitted":
@@ -3626,6 +3700,10 @@ def translate_call(name: str, args: list[str]) -> str:
         return "summary_py(" + py_args[0] + ")"
     if lname == "class":
         return "class_(" + py_args[0] + ")"
+    if lname == "date":
+        return "time.ctime()"
+    if lname == "source":
+        return "source_py(" + py_args[0] + ")"
     if lname == "length":
         return "r_length(" + py_args[0] + ")"
     if lname == "names":
@@ -3798,7 +3876,7 @@ def translate_lm_call(args: list[str]) -> str:
     data = keyword_arg(args, "data")
     if x == "." and data is not None:
         data_expr = translate_expr(data)
-        return f"lm_py({data_expr}.{y}, {data_expr}.xlag)"
+        return f"lm_py({data_expr}@@MEM@@{y}, {data_expr}@@MEM@@xlag)"
     if data is not None:
         data_expr = translate_expr(data)
         response = r_name(formula[:pos].strip())
@@ -4078,6 +4156,18 @@ def translate_read_csv_call(args: list[str]) -> str:
         raise R2PyError("read.csv requires a file")
     file_arg = translate_expr(args[0])
     return f"pd.read_csv({file_arg})"
+
+
+def translate_read_table_call(args: list[str]) -> str:
+    if not args:
+        raise R2PyError("read.table requires a file")
+    file_arg = translate_expr(args[0])
+    header = translate_expr(keyword_arg(args, "header", default="False"))
+    sep = keyword_arg(args, "sep")
+    sep_arg = "r'\\s+'" if sep is None or string_literal_value(sep.strip()) == "" else translate_expr(sep)
+    header_arg = "0" if header == "True" else "None"
+    names_arg = "" if header == "True" else ", header=None"
+    return f"pd.read_csv({file_arg}, sep={sep_arg}, header={header_arg}{names_arg})"
 
 
 def translate_write_lines_call(args: list[str]) -> str:
@@ -4751,9 +4841,13 @@ def r_name(name: str) -> str:
     if len(name) >= 2 and name[0] == "`" and name[-1] == "`":
         name = name[1:-1]
     constants = {"True", "False", "None", "np", "pd", "stats", "nan", "inf", "and", "or", "not", "is", "in", "if", "else", "for"}
-    if name in constants or "." in name or name.startswith("np.") or name.startswith("stats."):
+    if "@@MEM@@" in name:
+        return ".".join(r_name(part) for part in name.split("@@MEM@@"))
+    if name in constants or name.startswith(("np.", "stats.", "pd.", "time.")):
         return name
     if name[0].isdigit():
+        return name
+    if "." in name and name not in DOTTED_R_VARS:
         return name
     out = re.sub(r"\W+", "_", name.replace(".", "_")).strip("_")
     if not out:
@@ -4764,7 +4858,7 @@ def r_name(name: str) -> str:
 
 
 def r_function_name(name: str) -> str:
-    if name.startswith(("np.", "stats.", "pd.")):
+    if name.startswith(("np.", "stats.", "pd.", "time.")):
         return name
     return r_name(name.replace(".", "_"))
 
@@ -4974,8 +5068,8 @@ def numeric_stat_value_match(a: float, b: float) -> bool:
     return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)
 
 
-def run_python(path: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([sys.executable, str(path)], text=True, capture_output=True)
+def run_python(path: Path, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, str(path)], cwd=cwd, text=True, capture_output=True)
 
 
 def run_r(path: Path, rscript: str) -> subprocess.CompletedProcess[str]:
