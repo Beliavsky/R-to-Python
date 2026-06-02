@@ -1807,6 +1807,8 @@ def r_print(*args, digits=None, colnames=None):
     elif "RNamedVector" in globals() and isinstance(x, RNamedVector):
         labels = [str(label) for label in x.names]
         values = [r_format(v, digits) for v in x.values]
+        if len(labels) < len(values):
+            labels = labels + [""] * (len(values) - len(labels))
         widths = [max(len(label), len(value)) for label, value in zip(labels, values)]
         print(" ".join(label.rjust(widths[i]) for i, label in enumerate(labels)))
         print(" ".join(value.rjust(widths[i]) for i, value in enumerate(values)))
