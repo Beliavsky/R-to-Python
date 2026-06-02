@@ -70,6 +70,7 @@ def translate_source(source: str) -> str:
     python = return_function_tail_expressions(python)
     python = resolve_nonlocal_assignments(python)
     python = add_blank_lines_after_functions(python)
+    python = add_pass_to_empty_blocks(python)
     if "stats." in python or "aov_py(" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom scipy import stats\n", 1)
     if "optimize." in python or "uniroot_py(" in python:
@@ -84,6 +85,7 @@ def translate_source(source: str) -> str:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom sklearn.cluster import KMeans\n", 1)
     if re.search(r"(?<![\w.])pi(?![\w.])", python):
         python = python.replace("\n\n", "\npi = np.pi\n\n", 1)
+    python = sanitize_python_syntax_names(python)
     python = add_runtime_helpers(python)
     python = inject_known_fast_paths(python)
     if "SimpleNamespace" in python:
@@ -119,7 +121,7 @@ def preprocess_simple_inline_r(source: str) -> str:
     """
     out: list[str] = []
     pending_closes: list[str] = []
-    for raw in source.splitlines():
+    for raw in join_r_continuation_lines(source):
         line = expand_inline_function_assignment(raw)
         pieces = expand_one_line_control(line)
         for piece in pieces:
@@ -134,6 +136,34 @@ def preprocess_simple_inline_r(source: str) -> str:
     return "\n".join(out) + ("\n" if source.endswith("\n") else "")
 
 
+def join_r_continuation_lines(source: str) -> list[str]:
+    out: list[str] = []
+    buffer = ""
+    for raw in source.splitlines():
+        if buffer:
+            buffer = buffer.rstrip() + " " + raw.strip()
+        else:
+            buffer = raw
+        if r_line_continues(buffer):
+            continue
+        out.append(buffer)
+        buffer = ""
+    if buffer:
+        out.append(buffer)
+    return out
+
+
+def r_line_continues(line: str) -> bool:
+    stripped = strip_r_comment(line).rstrip()
+    if not stripped:
+        return False
+    if stripped.endswith(("{", "}", ";")):
+        return False
+    if stripped.endswith("=") and len(stripped) >= 2 and stripped[-2] not in {"=", "!", "<", ">"}:
+        return True
+    return bool(re.search(r"(\+|-|\*|/|\||&|,)\s*$", stripped))
+
+
 def expand_inline_function_assignment(line: str) -> str:
     match = re.match(r"^(\s*)([A-Za-z_][\w.]*\s*(?:<-|=)\s*)function\s*\(([^)]*)\)\s*\{\s*(.*?)\s*\}\s*$", line)
     if not match:
@@ -144,15 +174,33 @@ def expand_inline_function_assignment(line: str) -> str:
 
 
 def expand_one_line_control(line: str) -> list[str]:
+    if re.match(r"^\s*else\s+if\s*\(", line):
+        return [line]
+    parsed_else = parse_one_line_else(line)
+    if parsed_else is not None:
+        indent, tail = parsed_else
+        if not tail:
+            return [f"{indent}else {{"]
+        if tail.startswith("{"):
+            return [line]
+        return [f"{indent}else {{", f"{indent}{INDENT}{tail}", f"{indent}}}"]
     parsed = parse_one_line_control(line)
     if parsed is None:
         return [line]
     indent, head, tail = parsed
+    head = sanitize_control_head(head)
     if not tail:
         return [f"{indent}{head} {{"]
     if tail.startswith("{"):
-        return [line]
+        return [f"{indent}{head} {tail}"]
     return [f"{indent}{head} {{", f"{indent}{INDENT}{tail}", f"{indent}}}"]
+
+
+def parse_one_line_else(line: str) -> tuple[str, str] | None:
+    match = re.match(r"^(\s*)else\b(.*)$", line)
+    if not match:
+        return None
+    return match.group(1), match.group(2).strip()
 
 
 def parse_one_line_control(line: str) -> tuple[str, str, str] | None:
@@ -167,6 +215,21 @@ def parse_one_line_control(line: str) -> tuple[str, str, str] | None:
     head = line[len(indent) : end + 1].strip()
     tail = line[end + 1 :].strip()
     return indent, head, tail
+
+
+def sanitize_control_head(head: str) -> str:
+    match = re.match(r"^for\s*\(\s*([A-Za-z_][\w.]*)\s+in\s+(.*?)\s*\)$", head)
+    if not match:
+        return head
+    var, values = match.groups()
+    return f"for ({r_identifier_name(var)} in {values})"
+
+
+def r_identifier_name(name: str) -> str:
+    out = name.replace(".", "_")
+    if keyword.iskeyword(out):
+        out += "_"
+    return out
 
 
 def find_matching_char(text: str, start: int, open_ch: str, close_ch: str) -> int:
@@ -191,8 +254,43 @@ def find_matching_char(text: str, start: int, open_ch: str, close_ch: str) -> in
 
 
 def is_open_control_line(line: str) -> bool:
+    parsed_else = parse_one_line_else(line)
+    if parsed_else is not None:
+        return parsed_else[1] in {"", "{"}
     parsed = parse_one_line_control(line)
     return parsed is not None and parsed[2] in {"", "{"}
+
+
+def sanitize_python_syntax_names(python: str) -> str:
+    python = python.replace(".Machine.double.xmax", "np.finfo(float).max")
+    python = python.replace(".Machine.double.xmin", "np.finfo(float).tiny")
+    python = python.replace(".Machine.double.eps", "np.finfo(float).eps")
+    python = python.replace(".Machine.double.base", "2")
+    python = python.replace(".Machine.double.digits", "np.finfo(float).nmant")
+    python = python.replace(".Machine.double.min.exp", "np.finfo(float).minexp")
+    python = python.replace(".Machine.double.max.exp", "np.finfo(float).maxexp")
+    python = python.replace(".Machine.integer.max", "np.iinfo(np.int32).max")
+    replacements = {
+        "is.numeric": "r_is_numeric",
+        "is.vector": "r_is_vector",
+        "is.matrix": "r_is_matrix",
+    }
+    for old, new in replacements.items():
+        python = re.sub(rf"(?<![\w.]){re.escape(old)}\s*\(", f"{new}(", python)
+    for name in keyword.kwlist:
+        if name == "lambda":
+            continue
+        python = re.sub(rf"\.{name}\b", f".{name}_", python)
+    python = normalize_dotted_call_syntax(python)
+    python = re.sub(r"r_matrix_index_get\(([^,\n]+),\s*:(\d+)\)", r"r_matrix_index_get(\1, r_seq(1, \2))", python)
+    python = python.replace("try_(lambda_:", "try_(lambda:")
+    return python
+
+
+def normalize_dotted_call_syntax(python: str) -> str:
+    python = re.sub(r"(?<![\w.])([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+)\s*\(", lambda m: r_function_name(m.group(1)) + "(", python)
+    python = re.sub(r"(?<![=!<>])\b([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+)\s*=", lambda m: normalize_keyword_name(m.group(1)) + "=", python)
+    return python
 
 
 def remove_unused_numpy_import(python: str) -> str:
@@ -207,6 +305,27 @@ def remove_unused_numpy_import(python: str) -> str:
 
 def add_runtime_helpers(python: str) -> str:
     helpers: list[str] = []
+    if "r_is_numeric(" in python or "r_is_vector(" in python or "r_is_matrix(" in python:
+        helpers.append(
+            """
+def r_is_numeric(x):
+    try:
+        arr = np.asarray(x)
+    except Exception:
+        return isinstance(x, (int, float, complex, np.number))
+    return np.issubdtype(arr.dtype, np.number)
+
+
+def r_is_vector(x):
+    if isinstance(x, np.ndarray):
+        return x.ndim <= 1
+    return not hasattr(x, "shape") or len(getattr(x, "shape", ())) <= 1
+
+
+def r_is_matrix(x):
+    return isinstance(x, np.ndarray) and x.ndim == 2
+""".strip()
+        )
     if "r_length(" in python or "r_set_length(" in python:
         helpers.append(
             """
@@ -1880,8 +1999,38 @@ def add_blank_lines_after_functions(python: str) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
+def add_pass_to_empty_blocks(python: str) -> str:
+    lines = python.splitlines()
+    out: list[str] = []
+    for i, line in enumerate(lines):
+        out.append(line)
+        if not line.rstrip().endswith(":"):
+            continue
+        if line.lstrip().startswith("def "):
+            continue
+        indent = len(line) - len(line.lstrip())
+        j = i + 1
+        while j < len(lines) and not lines[j].strip():
+            j += 1
+        if j >= len(lines):
+            out.append(" " * (indent + len(INDENT)) + "pass")
+            continue
+        next_indent = len(lines[j]) - len(lines[j].lstrip())
+        if next_indent <= indent:
+            out.append(" " * (indent + len(INDENT)) + "pass")
+    return "\n".join(out).rstrip() + "\n"
+
+
 def translate_statement(line: str) -> list[str]:
     global PENDING_FUNCTION_PARAMS
+    expr_func_match = re.match(r"([A-Za-z]\w*(?:\.\w+)*)\s*(?:<-|=)\s*function\s*\((.*?)\)\s+(.+)$", line)
+    if expr_func_match:
+        name, args, body = expr_func_match.groups()
+        params = function_param_names(args)
+        USER_FUNCTION_PARAMS[r_function_name(name)] = params
+        PENDING_FUNCTION_PARAMS = params
+        signature, setup = translate_function_signature(args)
+        return [f"def {r_function_name(name)}({signature}):", *[INDENT + line for line in setup], INDENT + "return " + translate_expr(body)]
     func_match = re.match(r"([A-Za-z]\w*(?:\.\w+)*)\s*(?:<-|=)\s*function\s*\((.*)\)\s*$", line)
     if func_match:
         name, args = func_match.groups()
@@ -2121,11 +2270,12 @@ def translate_function_signature(args: str) -> tuple[str, list[str]]:
     out: list[str] = []
     setup: list[str] = []
     previous: set[str] = set()
+    saw_dots = False
     for arg in split_args(args):
         if not arg:
             continue
         if arg.strip() == "...":
-            out.extend(["*args", "**kwargs"])
+            saw_dots = True
             continue
         pos = find_top_level_operator(arg, "=")
         if pos >= 0:
@@ -2141,6 +2291,8 @@ def translate_function_signature(args: str) -> tuple[str, list[str]]:
             name = r_name(arg.strip())
             out.append(name)
         previous.add(name)
+    if saw_dots:
+        out.extend(["*args", "**kwargs"])
     return ", ".join(out), setup
 
 
@@ -4174,9 +4326,25 @@ def scipy_dist_params(family: str, args: list[str]) -> tuple[str, list[str]]:
 def keyword_arg(args: list[str], name: str, default: str | None = None) -> str | None:
     for arg in args:
         pos = find_top_level_operator(arg, "=")
-        if pos >= 0 and arg[:pos].strip().lower() == name.lower():
+        if pos >= 0 and normalize_keyword_name(arg[:pos].strip()).lower() == normalize_keyword_name(name).lower():
             return arg[pos + 1 :].strip()
     return default
+
+
+def translate_call_arg(arg: str) -> str:
+    pos = find_top_level_operator(arg, "=")
+    if pos < 0:
+        return translate_expr(arg)
+    key = normalize_keyword_name(arg[:pos].strip())
+    value = arg[pos + 1 :].strip()
+    return f"{key}={translate_expr(value)}"
+
+
+def normalize_keyword_name(name: str) -> str:
+    out = r_name(name.strip().replace(".", "_"))
+    if out == "lambda":
+        return "lambda_"
+    return out
 
 
 def apply_partial_argument_matching(name: str, args: list[str]) -> list[str]:
@@ -4240,7 +4408,7 @@ def apply_recycled_binops(expr: str) -> str:
 def r_name(name: str) -> str:
     if not name:
         return name
-    constants = {"True", "False", "None", "np", "pd", "stats", "nan", "inf", "and", "or", "not", "is", "in", "if", "else", "for", "lambda"}
+    constants = {"True", "False", "None", "np", "pd", "stats", "nan", "inf", "and", "or", "not", "is", "in", "if", "else", "for"}
     if name in constants or "." in name or name.startswith("np.") or name.startswith("stats."):
         return name
     if name[0].isdigit():
