@@ -927,6 +927,16 @@ def r_paste(*values, sep=" ", collapse=None):
     return out
 """.strip()
         )
+    if "r_substr(" in python:
+        helpers.append(
+            """
+def r_substr(x, start, stop):
+    scalar = np.asarray(x).ndim == 0
+    arr = np.atleast_1d(np.asarray(x, dtype=str))
+    out = np.array([str(item)[int(start) - 1:int(stop)] for item in arr])
+    return out[0] if scalar else out
+""".strip()
+        )
     if "head_py(" in python or "tail_py(" in python:
         helpers.append(
             """
@@ -3103,7 +3113,7 @@ def replace_innermost_call(expr: str) -> str:
     pattern = re.compile(r"(?<![\w.])([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)\s*\(")
     for match in pattern.finditer(expr):
         name = match.group(1)
-        if name.startswith(("np.", "stats.", "pd.")) or name in {"SimpleNamespace", "RList", "RNamedVector", "RFactor", "RTimeSeries", "r_print", "r_s3_print", "r_s3_dispatch", "r_add", "r_sub", "r_mul", "r_div", "r_seq", "r_range", "r_subset", "r_set_subset", "r_subset_df", "r_with", "r_within", "r_col_key", "r_row_key", "r_attr", "r_set_attr", "r_attributes", "r_eval", "r_parse", "r_paste", "r_factor", "r_levels", "r_factor_int", "r_table", "r_tapply", "cut_py", "r_lapply", "r_sapply", "r_mapply", "outer_py", "r_split", "r_unsplit", "r_as_date", "r_date_add", "r_date_format", "r_date_seq", "r_diff", "r_ts", "r_start", "r_end", "r_frequency", "r_window", "r_lag", "arima_py", "arima_sim_py", "kmeans_py", "stack_py", "unstack_py", "prcomp_py", "aov_py", "glm_py", "r_list_from_dots", "do_call_py", "capture_output_py", "rle_py", "inverse_rle_py", "r_df_col", "r_data_frame", "r_model_matrix", "r_matrix_data", "cbind_py", "rbind_py", "acf_py", "uniroot_py", "integrate_py", "try_catch_py", "eigen_py", "svd_py", "qr_py", "summary_py", "ecdf_py", "getattr", "globals", "int", "float", "str", "len"}:
+        if name.startswith(("np.", "stats.", "pd.")) or name in {"SimpleNamespace", "RList", "RNamedVector", "RFactor", "RTimeSeries", "r_print", "r_s3_print", "r_s3_dispatch", "r_add", "r_sub", "r_mul", "r_div", "r_seq", "r_range", "r_subset", "r_set_subset", "r_subset_df", "r_with", "r_within", "r_col_key", "r_row_key", "r_attr", "r_set_attr", "r_attributes", "r_eval", "r_parse", "r_paste", "r_substr", "r_factor", "r_levels", "r_factor_int", "r_table", "r_tapply", "cut_py", "r_lapply", "r_sapply", "r_mapply", "outer_py", "r_split", "r_unsplit", "r_as_date", "r_date_add", "r_date_format", "r_date_seq", "r_diff", "r_ts", "r_start", "r_end", "r_frequency", "r_window", "r_lag", "arima_py", "arima_sim_py", "kmeans_py", "stack_py", "unstack_py", "prcomp_py", "aov_py", "glm_py", "r_list_from_dots", "do_call_py", "capture_output_py", "rle_py", "inverse_rle_py", "r_df_col", "r_data_frame", "r_model_matrix", "r_matrix_data", "cbind_py", "rbind_py", "acf_py", "uniroot_py", "integrate_py", "try_catch_py", "eigen_py", "svd_py", "qr_py", "summary_py", "ecdf_py", "getattr", "globals", "int", "float", "str", "len"}:
             continue
         open_pos = expr.find("(", match.start())
         close_pos = find_matching_paren(expr, open_pos)
@@ -3613,7 +3623,7 @@ def translate_call(name: str, args: list[str]) -> str:
         x = py_args[0]
         start = py_args[1]
         stop = py_args[2]
-        return f"np.array([str(_s)[int({start}) - 1:int({stop})] for _s in np.asarray({x}, dtype=str)])"
+        return f"r_substr({x}, {start}, {stop})"
     if lname == "grepl":
         return f"regex_grepl({py_args[0]}, {py_args[1]})"
     if lname == "grep":
