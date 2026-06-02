@@ -1216,6 +1216,9 @@ def r_vec_subset(x, key):
     if isinstance(key, (bool, np.bool_)):
         return values if key else values[:0]
     arr = np.asarray(key)
+    if np.asarray(values).ndim == 0:
+        idx = int(arr) if arr.ndim == 0 else int(np.asarray(arr).ravel()[0])
+        return values if idx == 1 else np.asarray(values)[:0]
     if arr.dtype == bool:
         out = np.asarray(values)[arr]
         if names is not None:
@@ -2784,7 +2787,7 @@ def translate_simple_ascending_for_range(start: str, stop: str) -> str | None:
         if stop_i >= start_i:
             return f"range({start_i}, {stop_i + 1})"
         return None
-    if re.fullmatch(r"-?\d+", start) and re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", stop):
+    if re.fullmatch(r"-?\d+", start) and start == "1" and re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", stop):
         return f"range({int(start)}, {translate_expr(stop)} + 1)"
     return None
 
