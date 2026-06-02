@@ -468,7 +468,13 @@ def source_py(path):
     if py_path.lower().endswith((".r", ".R")):
         py_path = py_path[:-2] + ".py"
     try:
-        globals().update(runpy.run_path(py_path))
+        namespace = runpy.run_path(py_path)
+        globals().update(namespace)
+        try:
+            import __main__ as _main
+            vars(_main).update(namespace)
+        except Exception:
+            pass
     except FileNotFoundError:
         return None
     return None
@@ -587,6 +593,19 @@ def r_matrix_data(x):
     if arr.ndim == 0 and np.issubdtype(arr.dtype, np.number):
         return np.asarray(x, dtype=float)
     return arr
+""".strip()
+        )
+    if "t_py(" in python:
+        helpers.append(
+            """
+def t_py(x):
+    if hasattr(x, "values") and hasattr(x, "names"):
+        return x
+    values = x
+    arr = np.asarray(values)
+    if arr.ndim == 1:
+        return arr.reshape((1, arr.size))
+    return arr.T
 """.strip()
         )
     if "r_unique(" in python or "r_duplicated(" in python or "r_match(" in python or "r_in(" in python:
@@ -842,6 +861,26 @@ def r_paste(*values, sep=" ", collapse=None):
     if collapse is not None:
         return str(collapse).join(out.tolist())
     return out
+""".strip()
+        )
+    if "head_py(" in python or "tail_py(" in python:
+        helpers.append(
+            """
+def head_py(x, n=6):
+    n = int(n)
+    if isinstance(x, (pd.Series, pd.DataFrame)):
+        out = x.iloc[:n]
+    else:
+        out = x[:n]
+    return out.iloc[0] if n == 1 and isinstance(out, (pd.Series, pd.DataFrame)) else (out[0] if n == 1 else out)
+
+def tail_py(x, n=6):
+    n = int(n)
+    if isinstance(x, (pd.Series, pd.DataFrame)):
+        out = x.iloc[-n:]
+    else:
+        out = x[-n:]
+    return out.iloc[-1] if n == 1 and isinstance(out, (pd.Series, pd.DataFrame)) else (out[-1] if n == 1 else out)
 """.strip()
         )
     if "regex_" in python:
@@ -1425,11 +1464,27 @@ def cut_py(x, breaks):
 def r_df_col(x):
     if isinstance(x, RFactor):
         return pd.Categorical(x.values, categories=x.levels, ordered=x.ordered)
+    if hasattr(x, "values") and hasattr(x, "names"):
+        return x.values
+    arr = np.asarray(x)
+    if arr.ndim > 1:
+        return arr.ravel(order="F")
     return x
 
 
-def r_data_frame(**kwargs):
-    return pd.DataFrame({name: r_df_col(value) for name, value in kwargs.items()})
+def r_data_frame(*items, **kwargs):
+    out = {}
+    for name, value in items:
+        if name is None and hasattr(value, "values") and hasattr(value, "names"):
+            for col_name, col_value in zip(value.names, value.values):
+                out[str(col_name)] = [col_value]
+            continue
+        if name is None:
+            name = f"x{len(out) + 1}"
+        out[str(name)] = r_df_col(value)
+    for name, value in kwargs.items():
+        out[name] = r_df_col(value)
+    return pd.DataFrame(out)
 
 
 def r_tibble_frame(pairs):
@@ -2730,7 +2785,7 @@ def split_assignment(line: str) -> tuple[str, str] | None:
     assign = raw_assignment(line)
     if assign is not None:
         lhs, rhs = assign
-        if re.match(r"^[A-Za-z.]\w*(?:\[.*\])?$", lhs):
+        if re.match(r"^[A-Za-z]\w*(?:\.\w+)*(?:\[.*\])?$", lhs):
             base_lhs = lhs.split("[", 1)[0]
             if "." in base_lhs:
                 DOTTED_R_VARS.add(base_lhs)
@@ -3495,6 +3550,8 @@ def translate_call(name: str, args: list[str]) -> str:
     if lname == "sweep":
         return translate_sweep_call(args)
     if lname == "t":
+        if re.match(r"^[A-Za-z_]\w*$", py_args[0]):
+            return "t_py(" + py_args[0] + ")"
         return "(" + py_args[0] + ").T"
     if lname == "backsolve":
         return translate_backsolve_call(args)
@@ -3912,21 +3969,25 @@ def translate_aov_call(args: list[str]) -> str:
 
 
 def translate_data_frame_call(args: list[str]) -> str:
-    fields: list[str] = []
-    unnamed = 0
+    items: list[tuple[str | None, str, bool]] = []
+    needs_pair_form = False
     for arg in args:
         pos = find_top_level_operator(arg, "=")
         if pos >= 0:
             name = r_name(arg[:pos].strip())
             value = translate_expr(arg[pos + 1 :].strip())
+            items.append((name, value, True))
         else:
             value = translate_expr(arg)
             if re.match(r"^[A-Za-z_]\w*$", value):
-                name = value
+                items.append((value, value, True))
             else:
-                unnamed += 1
-                name = f"x{unnamed}"
-        fields.append(f"{name}={value}")
+                items.append((None, value, False))
+                needs_pair_form = True
+    if needs_pair_form:
+        fields = [f"({name!r}, {value})" for name, value, _named in items]
+    else:
+        fields = [f"{name}={value}" for name, value, _named in items if name is not None]
     return "r_data_frame(" + ", ".join(fields) + ")"
 
 
@@ -4479,9 +4540,9 @@ def translate_tail_call(args: list[str]) -> str:
         raise R2PyError("tail requires an array")
     x = translate_expr(args[0])
     n = translate_expr(args[1] if len(args) > 1 and "=" not in args[1] else keyword_arg(args, "n", default="6"))
-    if n == "1":
+    if n == "1" and re.match(r"^[A-Za-z_]\w*$", x) and x not in {"df", "data", "z", "values"}:
         return f"{x}[-1]"
-    return f"{x}[-{n}:]"
+    return f"tail_py({x}, {n})"
 
 
 def translate_head_call(args: list[str]) -> str:
@@ -4489,9 +4550,9 @@ def translate_head_call(args: list[str]) -> str:
         raise R2PyError("head requires an array")
     x = translate_expr(args[0])
     n = translate_expr(args[1] if len(args) > 1 and "=" not in args[1] else keyword_arg(args, "n", default="6"))
-    if n == "1":
+    if n == "1" and re.match(r"^[A-Za-z_]\w*$", x) and x not in {"df", "data", "z", "values"}:
         return f"{x}[0]"
-    return f"{x}[:{n}]"
+    return f"head_py({x}, {n})"
 
 
 def translate_matrix_call(args: list[str]) -> str:
