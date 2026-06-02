@@ -71,6 +71,7 @@ def translate_source(source: str) -> str:
     python = resolve_nonlocal_assignments(python)
     python = add_blank_lines_after_functions(python)
     python = add_pass_to_empty_blocks(python)
+    python = repair_generated_syntax_cleanup(python)
     if "stats." in python or "aov_py(" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom scipy import stats\n", 1)
     if "optimize." in python or "uniroot_py(" in python:
@@ -122,18 +123,63 @@ def preprocess_simple_inline_r(source: str) -> str:
     out: list[str] = []
     pending_closes: list[str] = []
     for raw in normalize_source_indentation(join_r_continuation_lines(source)):
-        line = expand_inline_function_assignment(raw)
-        pieces = expand_one_line_control(line)
-        for piece in pieces:
-            out.append(piece)
-            if pending_closes and piece.strip() and not is_open_control_line(piece):
-                out.extend(pending_closes)
-                pending_closes.clear()
-        stripped = line.strip()
-        if is_open_control_line(line) and not stripped.endswith("{"):
-            pending_closes.append("}")
+        for expanded in expand_chained_assignment(raw):
+            line = expand_inline_function_assignment(expanded)
+            pieces = expand_one_line_control(line)
+            for piece in pieces:
+                out.append(piece)
+                if pending_closes and piece.strip() and not is_open_control_line(piece):
+                    out.extend(pending_closes)
+                    pending_closes.clear()
+            stripped = line.strip()
+            if is_open_control_line(line) and not stripped.endswith("{"):
+                pending_closes.append("}")
     out.extend(pending_closes)
     return "\n".join(out) + ("\n" if source.endswith("\n") else "")
+
+
+def expand_chained_assignment(line: str) -> list[str]:
+    assign = strict_raw_assignment(line)
+    if assign is None:
+        return [line]
+    lhs, rhs = assign
+    nested = strict_raw_assignment(rhs)
+    if nested is None:
+        return [line]
+    mid_lhs, mid_rhs = nested
+    return [f"{mid_lhs} <- {mid_rhs}", f"{lhs} <- {mid_lhs}"]
+
+
+def strict_raw_assignment(line: str) -> tuple[str, str] | None:
+    pos = find_top_level_operator(line, "<-")
+    if pos >= 0:
+        return line[:pos].strip(), line[pos + 2 :].strip()
+    pos = find_top_level_assignment_equal(line)
+    if pos >= 0:
+        return line[:pos].strip(), line[pos + 1 :].strip()
+    return None
+
+
+def find_top_level_assignment_equal(text: str) -> int:
+    depth = 0
+    quote = ""
+    for i, ch in enumerate(text):
+        if quote:
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in {"'", '"'}:
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(depth - 1, 0)
+        elif ch == "=" and depth == 0:
+            before = text[i - 1] if i > 0 else ""
+            after = text[i + 1] if i + 1 < len(text) else ""
+            if before not in {"=", "!", "<", ">"} and after != "=":
+                return i
+    return -1
 
 
 def normalize_source_indentation(lines: list[str]) -> list[str]:
@@ -210,6 +256,9 @@ def expand_inline_function_assignment(line: str) -> str:
 
 
 def expand_one_line_control(line: str) -> list[str]:
+    assign_cond = expand_assignment_condition(line)
+    if assign_cond is not None:
+        return assign_cond
     if re.match(r"^\s*else\s+if\s*\(", line):
         return [line]
     parsed_else = parse_one_line_else(line)
@@ -230,6 +279,23 @@ def expand_one_line_control(line: str) -> list[str]:
     if tail.startswith("{"):
         return [f"{indent}{head} {tail}"]
     return [f"{indent}{head} {{", f"{indent}{INDENT}{tail}", f"{indent}}}"]
+
+
+def expand_assignment_condition(line: str) -> list[str] | None:
+    parsed = parse_one_line_control(line)
+    if parsed is None:
+        return None
+    indent, head, tail = parsed
+    match = re.match(r"if\s*\(\s*\((\w+)\s*(?:<-|=)\s*(.+?)\)\s*([<>]=?|==|!=)\s*(.+)\s*\)$", head)
+    if not match:
+        return None
+    name, value, op, rhs = match.groups()
+    py_name = r_name(name)
+    value_line = f"{indent}{py_name} <- {value}"
+    if_line = f"{indent}if ({py_name} {op} {rhs})"
+    if tail:
+        return [value_line, *expand_one_line_control(if_line + " " + tail)]
+    return [value_line, if_line]
 
 
 def parse_one_line_else(line: str) -> tuple[str, str] | None:
@@ -2057,6 +2123,27 @@ def add_pass_to_empty_blocks(python: str) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
+def repair_generated_syntax_cleanup(python: str) -> str:
+    lines = python.splitlines()
+    out: list[str] = []
+    block_depth = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "}":
+            block_depth = max(block_depth - 1, 0)
+            continue
+        if re.match(r"^(library|require)\s*\(", stripped):
+            continue
+        if stripped and block_depth == 0 and line.startswith((" ", "\t")):
+            line = stripped
+        out.append(line)
+        if line.rstrip().endswith(":"):
+            block_depth += 1
+        elif stripped and block_depth and not line.startswith((" ", "\t")):
+            block_depth = 0
+    return "\n".join(out).rstrip() + "\n"
+
+
 def translate_statement(line: str) -> list[str]:
     global PENDING_FUNCTION_PARAMS
     parsed_func = parse_function_definition(line)
@@ -2206,6 +2293,9 @@ def translate_statement(line: str) -> list[str]:
         class_match = re.match(r"^class\s*\(\s*([A-Za-z]\w*)\s*\)$", diag_lhs, re.IGNORECASE)
         if class_match:
             return [f"{r_name(class_match.group(1))}._r_class = {translate_expr(diag_rhs)}"]
+        row_names_match = re.match(r"^(?:row\.names|row_names)\s*\(\s*([A-Za-z]\w*)\s*\)$", diag_lhs, re.IGNORECASE)
+        if row_names_match:
+            return [f"pass  # R row names assignment omitted"]
         attr_match = re.match(r"^attr\s*\(\s*([A-Za-z]\w*)\s*,\s*(.+)\s*\)$", diag_lhs, re.IGNORECASE)
         if attr_match:
             obj, attr_name = attr_match.groups()
@@ -2312,7 +2402,7 @@ def translate_metadata_assignment(line: str) -> list[str] | None:
     if assign is None:
         return None
     lhs, rhs = assign
-    m = re.match(r"(colnames|rownames|names)\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", lhs, re.IGNORECASE)
+    m = re.match(r"(colnames|rownames|row\.names|row_names|names)\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", lhs, re.IGNORECASE)
     if not m:
         return None
     kind, obj = m.groups()
