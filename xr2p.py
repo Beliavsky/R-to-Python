@@ -469,10 +469,26 @@ def source_py(path):
         py_path = py_path[:-2] + ".py"
     try:
         namespace = runpy.run_path(py_path)
+        try:
+            import __main__ as _main
+            main_vars = vars(_main)
+            for key, value in list(namespace.items()):
+                if callable(value) and hasattr(value, "__globals__") and not key.startswith("__"):
+                    def _wrap_source_func(*args, __func=value, **kwargs):
+                        __func.__globals__.update(vars(_main))
+                        return __func(*args, **kwargs)
+                    _wrap_source_func.__name__ = getattr(value, "__name__", key)
+                    namespace[key] = _wrap_source_func
+        except Exception:
+            pass
         globals().update(namespace)
         try:
             import __main__ as _main
-            vars(_main).update(namespace)
+            main_vars = vars(_main)
+            main_vars.update(namespace)
+            for value in namespace.values():
+                if callable(value) and hasattr(value, "__globals__"):
+                    value.__globals__.update(main_vars)
         except Exception:
             pass
     except FileNotFoundError:
@@ -3557,6 +3573,8 @@ def translate_call(name: str, args: list[str]) -> str:
     if lname == "backsolve":
         return translate_backsolve_call(args)
     if lname == "diag":
+        if len(py_args) >= 2:
+            return "(np.eye(int(" + py_args[1] + ")) * (" + py_args[0] + "))"
         return "(np.eye(int(" + py_args[0] + ")) if np.isscalar(" + py_args[0] + ") else np.diag(" + py_args[0] + "))"
     if lname == "lower.tri":
         return "np.tril(np.ones_like(" + py_args[0] + ", dtype=bool), k=-1)"
