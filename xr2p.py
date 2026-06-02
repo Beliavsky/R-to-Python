@@ -2869,6 +2869,8 @@ def translate_expr_code(expr: str) -> str:
     expr = expr.replace("%*%", "@")
     expr = expr.replace("&&", " and ")
     expr = expr.replace("||", " or ")
+    expr = re.sub(r"(?<=[\w.)])\s*\|\s*(?=[\w.(])", " or ", expr)
+    expr = re.sub(r"(?<=[\w.)])\s*&\s*(?=[\w.(])", " and ", expr)
     expr = re.sub(r"!\s*(?!=)", "not ", expr)
     expr = replace_complex_literals(expr)
     expr = replace_power(expr)
@@ -4611,7 +4613,7 @@ def translate_matrix_call(args: list[str]) -> str:
     byrow = translate_expr(keyword_arg(args, "byrow", default="False"))
     order = "'C'" if byrow == "True" else "'F'"
     if nrow is None and ncol is None:
-        return f"r_matrix_data({data})"
+        return f"r_matrix_data({data}).reshape((-1, 1), order={order})"
     if nrow is None:
         return f"r_matrix_data({data}).reshape((-1, {translate_expr(ncol)}), order={order})"
     if ncol is None:
