@@ -2059,6 +2059,16 @@ def add_pass_to_empty_blocks(python: str) -> str:
 
 def translate_statement(line: str) -> list[str]:
     global PENDING_FUNCTION_PARAMS
+    parsed_func = parse_function_definition(line)
+    if parsed_func is not None:
+        name, args, body = parsed_func
+        params = function_param_names(args)
+        USER_FUNCTION_PARAMS[r_function_name(name)] = params
+        PENDING_FUNCTION_PARAMS = params
+        signature, setup = translate_function_signature(args)
+        if body is not None:
+            return [f"def {r_function_name(name)}({signature}):", *[INDENT + line for line in setup], INDENT + "return " + translate_expr(body)]
+        return [f"def {r_function_name(name)}({signature}):", *[INDENT + line for line in setup]]
     expr_func_match = re.match(r"([A-Za-z]\w*(?:\.\w+)*)\s*(?:<-|=)\s*function\s*\((.*?)\)\s+(.+)$", line)
     if expr_func_match:
         name, args, body = expr_func_match.groups()
@@ -2272,6 +2282,20 @@ def translate_statement(line: str) -> list[str]:
         return [f"{lhs} = {py_rhs}"]
 
     return [translate_expr(line)]
+
+
+def parse_function_definition(line: str) -> tuple[str, str, str | None] | None:
+    match = re.match(r"^\s*([A-Za-z]\w*(?:\.\w+)*)\s*(?:<-|=)\s*function\s*\(", line)
+    if not match:
+        return None
+    name = match.group(1)
+    open_pos = line.find("(", match.end() - 1)
+    close_pos = find_matching_char(line, open_pos, "(", ")")
+    if close_pos < 0:
+        return None
+    args = line[open_pos + 1 : close_pos]
+    body = line[close_pos + 1 :].strip()
+    return name, args, body or None
 
 
 def is_metadata_assignment(line: str) -> bool:
