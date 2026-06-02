@@ -2697,6 +2697,8 @@ def translate_metadata_assignment(line: str) -> list[str] | None:
     kind, obj = m.groups()
     if kind.lower() == "names":
         py_obj = r_name(obj)
+        if rhs.strip().upper() == "NULL":
+            return [f"{py_obj} = ({py_obj}.values if isinstance({py_obj}, RNamedVector) else {py_obj})"]
         NAMED_VECTOR_VARS.add(py_obj)
         return [f"{py_obj} = RNamedVector({py_obj}, list({translate_expr(rhs)}))"]
     if not re.match(r"c\s*\(", rhs.strip(), re.IGNORECASE):
