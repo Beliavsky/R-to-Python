@@ -104,7 +104,18 @@ def translate_source(source: str) -> str:
         python = python.replace("import numpy as np\n", "import numpy as np\nimport re\n", 1)
     if "Path(" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom pathlib import Path\n", 1)
+    python = remove_unused_numpy_import(python)
     return python
+
+
+def remove_unused_numpy_import(python: str) -> str:
+    prefix = "import numpy as np\n"
+    if not python.startswith(prefix):
+        return python
+    body = python[len(prefix) :]
+    if "np." in body:
+        return python
+    return body.lstrip("\n")
 
 
 def add_runtime_helpers(python: str) -> str:
@@ -2135,8 +2146,25 @@ def translate_for_iter(values: str) -> str:
     range_parts = split_top_level_range(values.strip())
     if range_parts is not None:
         start, stop = range_parts
+        simple = translate_simple_ascending_for_range(start, stop)
+        if simple is not None:
+            return simple
         return f"r_range({translate_expr(start)}, {translate_expr(stop)})"
     return translate_expr(values)
+
+
+def translate_simple_ascending_for_range(start: str, stop: str) -> str | None:
+    start = strip_outer_parens(start.strip())
+    stop = strip_outer_parens(stop.strip())
+    if re.fullmatch(r"-?\d+", start) and re.fullmatch(r"-?\d+", stop):
+        start_i = int(start)
+        stop_i = int(stop)
+        if stop_i >= start_i:
+            return f"range({start_i}, {stop_i + 1})"
+        return None
+    if re.fullmatch(r"-?\d+", start) and re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", stop):
+        return f"range({int(start)}, {translate_expr(stop)} + 1)"
+    return None
 
 
 def find_matching_paren(text: str, open_pos: int) -> int:
@@ -2604,6 +2632,12 @@ def is_string_literal(text: str) -> bool:
     return len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}
 
 
+def is_newline_literal(text: str) -> bool:
+    if not is_string_literal(text):
+        return False
+    return text[1:-1] in {r"\n", "\n"}
+
+
 def is_string_index_expr(text: str) -> bool:
     text = strip_outer_parens(text.strip())
     if is_string_literal(text):
@@ -2842,6 +2876,10 @@ def translate_call(name: str, args: list[str]) -> str:
             return "r_s3_print(" + py_args[0] + ")"
         return "r_print(" + ", ".join(py_args) + ")"
     if lname == "cat":
+        if args and is_newline_literal(args[-1].strip()):
+            if len(py_args) == 1:
+                return "print()"
+            return "print(" + ", ".join(py_args[:-1]) + ")"
         return "print(" + ", ".join(py_args) + ', end="")'
     if lname == "message":
         return "message_py(" + ", ".join(py_args) + ")"
@@ -2891,8 +2929,12 @@ def translate_call(name: str, args: list[str]) -> str:
         return f"np.angle({py_args[0]})"
     if lname == "conj":
         return f"np.conj({py_args[0]})"
-    if lname in {"log", "exp", "sin", "cos", "tan", "abs"}:
+    if lname in {"log", "exp", "sin", "cos", "tan", "abs", "floor"}:
         return f"np.{lname}(" + ", ".join(py_args) + ")"
+    if lname == "ceiling":
+        return "np.ceil(" + ", ".join(py_args) + ")"
+    if lname == "trunc":
+        return "np.trunc(" + ", ".join(py_args) + ")"
     if lname == "round":
         return "np.round(" + ", ".join(py_args) + ")"
     if lname == "chol":
@@ -4416,6 +4458,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("source", type=Path, help="R source file")
     parser.add_argument("-o", "--out", type=Path, help="output Python file")
     parser.add_argument("--tee", action="store_true", help="print the emitted Python code")
+    parser.add_argument("--tee-both", action="store_true", help="print the original R source and emitted Python code")
     parser.add_argument("--no-py-compile", action="store_true", help="skip python -m py_compile check")
     parser.add_argument("--run", action="store_true", help="run the generated Python")
     parser.add_argument("--run-both", action="store_true", help="run original R and generated Python")
@@ -4486,6 +4529,11 @@ def main(argv: list[str] | None = None) -> int:
     out = args.out or args.source.with_suffix(".py")
     out.write_text(python, encoding="utf-8")
     print(f"wrote {out}")
+    if args.tee_both:
+        print("R source:")
+        print(source, end="" if source.endswith("\n") else "\n")
+        print("Python translation:")
+        print(python, end="" if python.endswith("\n") else "\n")
     if args.tee:
         print(python, end="" if python.endswith("\n") else "\n")
     if not args.no_py_compile:
