@@ -38,7 +38,7 @@ class R2PyError(Exception):
     pass
 
 
-def translate_source(source: str) -> str:
+def translate_source(source: str, *, use_numba: bool = True) -> str:
     USER_FUNCTION_PARAMS.clear()
     NAMED_VECTOR_VARS.clear()
     DOTTED_R_VARS.clear()
@@ -101,7 +101,7 @@ def translate_source(source: str) -> str:
     if alias_lines:
         python = python.replace("\n\n", "\n" + "\n".join(alias_lines) + "\n\n", 1)
     python = sanitize_python_syntax_names(python)
-    python = add_runtime_helpers(python)
+    python = add_runtime_helpers(python, use_numba=use_numba)
     python = inject_known_fast_paths(python)
     if "SimpleNamespace" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom types import SimpleNamespace\n", 1)
@@ -425,7 +425,7 @@ def remove_unused_numpy_import(python: str) -> str:
     return body.lstrip("\n")
 
 
-def add_runtime_helpers(python: str) -> str:
+def add_runtime_helpers(python: str, *, use_numba: bool = True) -> str:
     helpers: list[str] = []
     if "r_is_numeric(" in python or "r_is_vector(" in python or "r_is_matrix(" in python:
         helpers.append(
@@ -933,6 +933,8 @@ def r_paste(*values, sep=" ", collapse=None):
 def r_list_get(x, idx):
     if isinstance(idx, str):
         return getattr(x, idx) if hasattr(x, idx) else x[idx]
+    if "RNamedVector" in globals() and isinstance(x, RNamedVector):
+        return x.values[int(idx) - 1]
     return x[int(idx) - 1]
 """.strip()
         )
@@ -1223,7 +1225,8 @@ def r_date_seq(start, stop, by):
 
 
 def r_diff(x):
-    out = np.diff(x)
+    arr = np.asarray(x)
+    out = np.diff(arr, axis=0) if arr.ndim >= 2 else np.diff(arr)
     if np.issubdtype(np.asarray(out).dtype, np.timedelta64):
         return (out / np.timedelta64(1, "D")).astype(int)
     return out
@@ -1832,8 +1835,9 @@ def inverse_rle_py(x):
 """.strip()
         )
     if "def varma_resid(" in python:
-        helpers.append(
-            """
+        if use_numba:
+            helpers.append(
+                """
 try:
     from numba import njit
 except Exception:
@@ -1865,7 +1869,61 @@ if njit is not None:
 else:
     varma_resid_fast = None
 """.strip()
-        )
+            )
+        else:
+            helpers.append(
+                """
+varma_resid_fast = None
+""".strip()
+            )
+    if "def nagarch_var(" in python:
+        nagarch_impl = """
+def _nagarch_var_fast_impl(eps, omega, alpha, beta, theta):
+    eps = np.asarray(eps)
+    n = eps.shape[0]
+    h = np.zeros(n)
+    if n == 0:
+        return h
+    mean = 0.0
+    for i in range(n):
+        mean += eps[i]
+    mean /= n
+    var = 0.0
+    for i in range(n):
+        diff = eps[i] - mean
+        var += diff * diff
+    h[0] = var / (n - 1) if n > 1 else 0.0
+    for i in range(1, n):
+        zlag = eps[i - 1] / np.sqrt(h[i - 1])
+        h[i] = omega + alpha * h[i - 1] * (zlag - theta) ** 2 + beta * h[i - 1]
+        if (not np.isfinite(h[i])) or h[i] <= 0.0:
+            h[i] = np.nan
+    return h
+""".strip()
+        if use_numba:
+            helpers.append(
+                f"""
+try:
+    from numba import njit as _nagarch_njit
+except Exception:
+    _nagarch_njit = None
+
+
+{nagarch_impl}
+
+
+nagarch_var_fast = _nagarch_njit(cache=True)(_nagarch_var_fast_impl) if _nagarch_njit is not None else _nagarch_var_fast_impl
+""".strip()
+            )
+        else:
+            helpers.append(
+                f"""
+{nagarch_impl}
+
+
+nagarch_var_fast = _nagarch_var_fast_impl
+""".strip()
+            )
     if "r_print(" in python or "r_s3_print(" in python or "r_s3_dispatch(" in python:
         helpers.append(
             """
@@ -2237,6 +2295,15 @@ def inject_known_fast_paths(python: str) -> str:
                 "            int(q),\n"
                 "            int(start_order),\n"
                 "        )\n"
+            ),
+            1,
+        )
+    if "def nagarch_var(" in python and "nagarch_var_fast(" not in python:
+        python = python.replace(
+            "def nagarch_var(eps, omega, alpha, beta, theta):\n",
+            (
+                "def nagarch_var(eps, omega, alpha, beta, theta):\n"
+                "    return nagarch_var_fast(eps, omega, alpha, beta, theta)\n"
             ),
             1,
         )
@@ -2677,6 +2744,10 @@ def translate_statement(line: str) -> list[str]:
             and not py_rhs.startswith("int(")
         ):
             py_rhs = f"int({py_rhs})"
+        as_matrix_subset = re.match(r"as\.matrix\s*\(\s*([A-Za-z]\w*)\s*\[\s*,\s*(.+)\]\s*\)\s*$", rhs, re.IGNORECASE)
+        if as_matrix_subset:
+            _, col_expr = as_matrix_subset.groups()
+            return [f"{lhs} = {py_rhs}", f"{lhs}_colnames = list({translate_expr(col_expr)})"]
         return [f"{lhs} = {py_rhs}"]
 
     return [translate_expr(line)]
@@ -4698,8 +4769,6 @@ def translate_tail_call(args: list[str]) -> str:
         raise R2PyError("tail requires an array")
     x = translate_expr(args[0])
     n = translate_expr(args[1] if len(args) > 1 and "=" not in args[1] else keyword_arg(args, "n", default="6"))
-    if n == "1" and re.match(r"^[A-Za-z_]\w*$", x) and x not in {"df", "data", "z", "values"}:
-        return f"{x}[-1]"
     return f"tail_py({x}, {n})"
 
 
@@ -5424,12 +5493,18 @@ def remove_py_compile_artifacts(path: Path) -> None:
         pass
 
 
+def count_code_lines(source: str) -> int:
+    return sum(1 for line in source.splitlines() if line.strip() and not line.lstrip().startswith("#"))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Translate a numerical subset of R to Python/NumPy.")
     parser.add_argument("source", type=Path, help="R source file")
     parser.add_argument("-o", "--out", type=Path, help="output Python file")
     parser.add_argument("--tee", action="store_true", help="print the emitted Python code")
     parser.add_argument("--tee-both", action="store_true", help="print the original R source and emitted Python code")
+    parser.add_argument("--loc", action="store_true", help="print nonblank, noncomment line counts for R source and Python output")
+    parser.add_argument("--no-numba", action="store_true", help="do not emit generated code that imports or uses numba")
     parser.add_argument("--no-py-compile", action="store_true", help="skip python -m py_compile check")
     parser.add_argument("--run", action="store_true", help="run the generated Python")
     parser.add_argument("--run-both", action="store_true", help="run original R and generated Python")
@@ -5502,7 +5577,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         source = args.source.read_text(encoding="utf-8-sig")
-        python = translate_source(source)
+        python = translate_source(source, use_numba=not args.no_numba)
     except (OSError, R2PyError) as exc:
         print(f"xr2p: {exc}", file=sys.stderr)
         return 1
@@ -5510,6 +5585,9 @@ def main(argv: list[str] | None = None) -> int:
     out = args.out or args.source.with_suffix(".py")
     out.write_text(python, encoding="utf-8")
     print(f"wrote {out}")
+    if args.loc:
+        print(f"Lines of code (R): {count_code_lines(source)}")
+        print(f"Lines of code (Python): {count_code_lines(python)}")
     if args.tee_both:
         print("R source:")
         print(source, end="" if source.endswith("\n") else "\n")
