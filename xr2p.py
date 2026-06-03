@@ -87,6 +87,8 @@ def translate_source(source: str, *, use_numba: bool = True) -> str:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom scipy import optimize\n", 1)
     if "integrate." in python or "integrate_py(" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom scipy import integrate\n", 1)
+    if "linalg." in python:
+        python = python.replace("import numpy as np\n", "import numpy as np\nfrom scipy import linalg\n", 1)
     if "arima_py(" in python or "arima_sim_py(" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom statsmodels.tsa.arima.model import ARIMA as SMARIMA\nfrom statsmodels.tsa.arima_process import ArmaProcess\n", 1)
     if "glm_py(" in python:
@@ -825,8 +827,8 @@ class RTimeSeries:
         self.start = tuple(np.asarray(start if start is not None else [1, 1], dtype=int).tolist())
         self.frequency = int(frequency)
 
-    def __array__(self, dtype=None):
-        return np.asarray(self.values, dtype=dtype)
+    def __array__(self, dtype=None, copy=None):
+        return np.array(self.values, dtype=dtype, copy=copy) if copy is not None else np.asarray(self.values, dtype=dtype)
 
     def __len__(self):
         return len(self.values)
@@ -1492,8 +1494,8 @@ class RFactor:
         self.levels = list(levels) if levels is not None else sorted(dict.fromkeys(self.values).keys())
         self.ordered = bool(ordered)
 
-    def __array__(self, dtype=None):
-        return np.asarray(self.values, dtype=dtype)
+    def __array__(self, dtype=None, copy=None):
+        return np.array(self.values, dtype=dtype, copy=copy) if copy is not None else np.asarray(self.values, dtype=dtype)
 
     def __len__(self):
         return len(self.values)
@@ -1688,8 +1690,8 @@ class RNamedVector:
         self.values = np.asarray(values)
         self.names = list(names)
 
-    def __array__(self, dtype=None):
-        return np.asarray(self.values, dtype=dtype)
+    def __array__(self, dtype=None, copy=None):
+        return np.array(self.values, dtype=dtype, copy=copy) if copy is not None else np.asarray(self.values, dtype=dtype)
 
     def __len__(self):
         return len(self.values)
@@ -2104,6 +2106,23 @@ def var_r(x):
     if x.ndim == 1:
         return np.var(x, ddof=1)
     return np.cov(x, rowvar=False, ddof=1)
+""".strip()
+        )
+    if "cor_py(" in python:
+        helpers.append(
+            """
+def cor_py(x, y=None, use=None):
+    x = np.asarray(x, dtype=float)
+    if y is None:
+        if use in {"pairwise.complete.obs", "complete.obs"}:
+            if x.ndim == 1:
+                x = x[np.isfinite(x)]
+            else:
+                x = x[np.all(np.isfinite(x), axis=1)]
+        return np.corrcoef(x, rowvar=False)
+    y = np.asarray(y, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y) if use in {"pairwise.complete.obs", "complete.obs"} else slice(None)
+    return np.corrcoef(x[mask], y[mask])[0, 1]
 """.strip()
         )
     if "lm_py(" in python or "glm_py(" in python or "aov_py(" in python or "summary_py(" in python:
@@ -3817,6 +3836,8 @@ def translate_call(name: str, args: list[str]) -> str:
         if len(py_args) >= 2:
             return "(np.eye(int(" + py_args[1] + ")) * (" + py_args[0] + "))"
         return "(np.eye(int(" + py_args[0] + ")) if np.isscalar(" + py_args[0] + ") else np.diag(" + py_args[0] + "))"
+    if lname == "toeplitz":
+        return "linalg.toeplitz(" + py_args[0] + ")"
     if lname == "lower.tri":
         return "np.tril(np.ones_like(" + py_args[0] + ", dtype=bool), k=-1)"
     if lname == "upper.tri":
@@ -3867,9 +3888,13 @@ def translate_call(name: str, args: list[str]) -> str:
             return "np.cov(" + py_args[0] + ", rowvar=False, ddof=1)"
         return "np.cov(" + py_args[0] + ", " + py_args[1] + ", ddof=1)"
     if lname == "cor":
-        if len(py_args) == 1:
-            return "np.corrcoef(" + py_args[0] + ", rowvar=False)"
-        return "np.corrcoef(" + py_args[0] + ", " + py_args[1] + ")[0, 1]"
+        cor_args = positional_args(args)
+        cor_py_args = [translate_expr(arg) for arg in cor_args]
+        use = keyword_arg(args, "use")
+        use_arg = "" if use is None else ", use=" + translate_expr(use)
+        if len(cor_py_args) == 1:
+            return "cor_py(" + cor_py_args[0] + use_arg + ")"
+        return "cor_py(" + cor_py_args[0] + ", " + cor_py_args[1] + use_arg + ")"
     if lname == "min":
         return "np.minimum(" + ", ".join(py_args) + ")" if len(py_args) > 1 else f"np.min({py_args[0]})"
     if lname == "max":
@@ -5221,7 +5246,7 @@ def r_name(name: str) -> str:
 
 
 def r_function_name(name: str) -> str:
-    if name.startswith(("np.", "stats.", "pd.", "time.")):
+    if name.startswith(("np.", "stats.", "pd.", "time.", "linalg.")):
         return name
     return r_name(name.replace(".", "_"))
 
@@ -5767,6 +5792,7 @@ RUNTIME_DOCSTRINGS = {
     "tail_py": "Return the last n elements or rows.",
     "head_py": "Return the first n elements or rows.",
     "var_r": "Return R-compatible sample variance or covariance.",
+    "cor_py": "Return R-compatible correlation, including common missing-value options.",
 }
 
 
