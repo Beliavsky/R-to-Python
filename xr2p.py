@@ -422,7 +422,7 @@ def sanitize_python_syntax_names(python: str) -> str:
 
 def normalize_dotted_call_syntax(python: str) -> str:
     python = re.sub(r"(?<![\w.])([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+)\s*\(", lambda m: r_function_name(m.group(1)) + "(", python)
-    python = re.sub(r"(?<![=!<>])\b([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+)\s*=", lambda m: normalize_keyword_name(m.group(1)) + "=", python)
+    python = re.sub(r"(?<![=!<>])\b([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+)\s*=(?!=)", lambda m: normalize_keyword_name(m.group(1)) + "=", python)
     return python
 
 
@@ -718,7 +718,10 @@ def r_match(x, table):
 
 def r_in(x, table):
     table_values = set(np.asarray(table).tolist())
-    return np.array([value in table_values for value in np.asarray(x)], dtype=bool)
+    arr = np.asarray(x)
+    if arr.ndim == 0:
+        return bool(arr.item() in table_values)
+    return np.array([value in table_values for value in arr], dtype=bool)
 """.strip()
         )
     if "arima_py(" in python or "arima_sim_py(" in python:
@@ -2141,6 +2144,14 @@ def determinant_py(x, logarithm=True):
     return RList(modulus=np.array([modulus]), sign=sign, _r_names=["modulus", "sign"])
 """.strip()
         )
+    if "polyroot_py(" in python:
+        helpers.append(
+            """
+def polyroot_py(x):
+    coeff = np.asarray(x, dtype=complex)
+    return np.roots(coeff[::-1])
+""".strip()
+        )
     if "cor_py(" in python:
         helpers.append(
             """
@@ -2808,6 +2819,20 @@ def translate_statement(line: str) -> list[str]:
             row = f"(r_which_min(r_subset({mat}, slice(None), r_col_key({mat}, {criterion!r}, globals().get('{mat}_colnames')))) - 1)"
             col = f"r_col_key({mat}, \"order\", globals().get('{mat}_colnames'))"
             return [f"{lhs} = int({mat}[{row}, {col}])"]
+        named_order_select = re.match(
+            r"^([A-Za-z]\w*)\s*\[\s*which\.min\s*\(\s*ifelse\s*\(\s*(.+?)\s*,\s*\1\s*\[\s*,\s*([\"'])([^\"']+)\3\s*\]\s*,\s*Inf\s*\)\s*\)\s*,\s*c\s*\((.+)\)\s*\]\s*$",
+            rhs,
+            re.IGNORECASE,
+        )
+        if named_order_select is not None:
+            mat = r_name(named_order_select.group(1))
+            cond = translate_expr(named_order_select.group(2))
+            criterion = named_order_select.group(4)
+            cols = [translate_expr(part.strip()) for part in split_args(named_order_select.group(5))]
+            col_names = f"r_c({', '.join(cols)})"
+            row = f"(r_which_min(np.where({cond}, r_subset({mat}, slice(None), r_col_key({mat}, {criterion!r}, globals().get('{mat}_colnames'))), np.inf)) - 1)"
+            col = f"np.array([r_col_key({mat}, _col, globals().get('{mat}_colnames')) for _col in np.ravel({col_names})])"
+            return [f"{lhs} = RNamedVector(r_subset({mat}, {row}, {col}), list({col_names}))"]
         py_rhs = translate_expr(rhs)
         if lhs in {"aic_order", "bic_order"}:
             criterion = lhs.split("_", 1)[0]
@@ -2931,7 +2956,10 @@ def translate_function_signature(args: str) -> tuple[str, list[str]]:
             else:
                 out.append(f"{name}={value}")
         else:
-            name = r_name(arg.strip())
+            raw_name = arg.strip()
+            if "." in raw_name:
+                DOTTED_R_VARS.add(raw_name)
+            name = r_name(raw_name)
             out.append(name)
         previous.add(name)
     if saw_dots:
@@ -2948,8 +2976,52 @@ def function_param_names(args: str) -> list[str]:
             continue
         pos = find_top_level_operator(arg, "=")
         name = arg[:pos].strip() if pos >= 0 else arg.strip()
+        if "." in name:
+            DOTTED_R_VARS.add(name)
         names.append(r_name(name))
     return names
+
+
+def translate_optim_call(args: list[str]) -> str:
+    par = keyword_arg(args, "par", default=args[0] if args else "None")
+    fn = keyword_arg(args, "fn", default=args[1] if len(args) > 1 else "None")
+    method = keyword_arg(args, "method", default='"BFGS"')
+    control = keyword_arg(args, "control", default="None")
+    control_expr = translate_optim_control(control)
+    kwargs: list[str] = []
+    for arg in args:
+        pos = find_top_level_operator(arg, "=")
+        if pos < 0:
+            continue
+        key = normalize_keyword_name(arg[:pos].strip())
+        if key in {"par", "fn", "method", "control"}:
+            continue
+        kwargs.append(f"{key}={translate_expr(arg[pos + 1:].strip())}")
+    base = [
+        f"par={translate_expr(par)}",
+        f"fn={translate_expr(fn)}",
+        f"method={translate_expr(method)}",
+        f"control={control_expr}",
+    ]
+    return "optim(" + ", ".join(base + kwargs) + ")"
+
+
+def translate_optim_control(control: str | None) -> str:
+    if control is None or control.strip() == "None":
+        return "None"
+    raw_call = parse_full_call(control.strip())
+    if raw_call is None or raw_call[0].lower() not in {"list", "rlist"}:
+        return translate_expr(control)
+    fields: list[str] = []
+    for arg in raw_call[1]:
+        pos = find_top_level_operator(arg, "=")
+        if pos < 0:
+            continue
+        key = normalize_keyword_name(arg[:pos].strip())
+        if key in {"_r_names", "r_names"}:
+            continue
+        fields.append(f"{key}={translate_expr(arg[pos + 1:].strip())}")
+    return "SimpleNamespace(" + ", ".join(fields) + ")"
 
 
 def expr_references_names(expr: str, names: set[str]) -> bool:
@@ -3232,6 +3304,9 @@ def replace_r_constants(expr: str) -> str:
         "FALSE": "False",
         "NULL": "None",
         "NA_real_": "np.nan",
+        "NA_integer_": "np.nan",
+        "NA_complex_": "np.nan",
+        "NA_character_": "np.nan",
         "NA": "np.nan",
         "NaN": "np.nan",
         "Inf": "np.inf",
@@ -3528,6 +3603,9 @@ def translate_matrix_subscript(index: str, *, base: str | None = None) -> str:
             out.append(f"r_row_key({base}, {item}, globals().get('{base}_rownames'))")
         elif axis == 1 and base and (is_string_literal(item) or re.fullmatch(r"__R_STR_\d+__", item)):
             out.append(f"r_col_key({base}, {item}, globals().get('{base}_colnames'))")
+        elif axis == 1 and base and is_string_index_expr(item) and not is_likely_dataframe_name(base):
+            cols = translate_expr(item)
+            out.append(f"np.array([r_col_key({base}, _col, globals().get('{base}_colnames')) for _col in np.ravel({cols})])")
         elif is_logical_subscript(item):
             out.append(item)
             advanced_axes.append(len(out) - 1)
@@ -3552,6 +3630,10 @@ def translate_matrix_axis_subscript(item: str) -> str:
     if re.match(r"^.+\[.+\]$", translated):
         return f"({translated}) - 1"
     return translated
+
+
+def is_likely_dataframe_name(name: str) -> bool:
+    return name in {"df", "prices"} or name.endswith("_df")
 
 
 def is_advanced_matrix_index(index: str) -> bool:
@@ -3598,7 +3680,10 @@ def is_character_vector_expr(text: str) -> bool:
     text = strip_outer_parens(text.strip())
     if is_string_literal(text):
         return True
-    if r_name(text) in CHARACTER_VECTOR_VARS:
+    py_name = r_name(text)
+    if py_name in CHARACTER_VECTOR_VARS:
+        return True
+    if re.fullmatch(r"[A-Za-z_]\w*_names", py_name):
         return True
     raw_call = parse_full_call(text)
     if raw_call is None:
@@ -3694,6 +3779,8 @@ def translate_call(name: str, args: list[str]) -> str:
         func = translate_expr(args[0])
         arg_list = translate_expr(args[1])
         return f"do_call_py({func}, {arg_list})"
+    if lname == "optim":
+        return translate_optim_call(args)
     if lname == "capture.output":
         return f"capture_output_py({translate_expr(args[0])})"
     if lname == "expression":
@@ -3961,6 +4048,8 @@ def translate_call(name: str, args: list[str]) -> str:
         return "np.linalg.solve(" + py_args[0] + ", " + py_args[1] + ")"
     if lname == "det":
         return "np.linalg.det(" + py_args[0] + ")"
+    if lname == "polyroot":
+        return "polyroot_py(" + py_args[0] + ")"
     if lname == "eigen":
         return "eigen_py(" + py_args[0] + ")"
     if lname == "svd":
@@ -4372,7 +4461,10 @@ def translate_data_frame_call(args: list[str]) -> str:
     for arg in args:
         pos = find_top_level_operator(arg, "=")
         if pos >= 0:
-            name = r_name(arg[:pos].strip())
+            raw_name = arg[:pos].strip()
+            if "." in raw_name:
+                DOTTED_R_VARS.add(raw_name)
+            name = r_name(raw_name)
             value = translate_expr(arg[pos + 1 :].strip())
             items.append((name, value, True))
         else:
