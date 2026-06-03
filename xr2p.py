@@ -2753,6 +2753,17 @@ def translate_statement(line: str) -> list[str]:
         tibble_call = parse_full_call(rhs)
         if tibble_call is not None and tibble_call[0].lower() in {"tibble", "tibble_row"} and re.match(r"^[A-Za-z]\w*$", lhs):
             return translate_tibble_assignment(r_name(lhs), tibble_call[1])
+        order_select = re.match(
+            r"^([A-Za-z]\w*)\s*\[\s*which\.min\s*\(\s*\1\s*\[\s*,\s*([\"'])([^\"']+)\2\s*\]\s*\)\s*,\s*([\"'])order\4\s*\]\s*$",
+            rhs,
+            re.IGNORECASE,
+        )
+        if order_select is not None and lhs.endswith("_order"):
+            mat = r_name(order_select.group(1))
+            criterion = order_select.group(3)
+            row = f"(r_which_min(r_subset({mat}, slice(None), r_col_key({mat}, {criterion!r}, globals().get('{mat}_colnames')))) - 1)"
+            col = f"r_col_key({mat}, \"order\", globals().get('{mat}_colnames'))"
+            return [f"{lhs} = int({mat}[{row}, {col}])"]
         py_rhs = translate_expr(rhs)
         if lhs in {"aic_order", "bic_order"}:
             criterion = lhs.split("_", 1)[0]
@@ -2761,6 +2772,7 @@ def translate_statement(line: str) -> list[str]:
                 lambda m: f"r_col_key({m.group(1)}, {criterion!r}, globals().get('{m.group(1)}_colnames'))",
                 py_rhs,
             )
+            py_rhs = re.sub(r"(r_which_min\([^,\n]+(?:\([^)]*\)[^,\n]*)*\))(?=,\s*r_col_key)", r"(\1) - 1", py_rhs)
         double_subscript_assign = re.match(r"^([A-Za-z]\w*)\[\[(.*)\]\]$", lhs)
         if double_subscript_assign:
             base, index = double_subscript_assign.groups()
