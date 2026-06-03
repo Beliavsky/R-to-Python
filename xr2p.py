@@ -1795,6 +1795,15 @@ class RNamedVector:
     def __rpow__(self, other):
         return self._rbinary(other, np.power)
 
+    def __neg__(self):
+        return RNamedVector(-self.values, self.names)
+
+    def __pos__(self):
+        return RNamedVector(+self.values, self.names)
+
+    def __abs__(self):
+        return RNamedVector(np.abs(self.values), self.names)
+
 
 def r_c(*values, names=None):
     flat_values = []
@@ -1913,18 +1922,13 @@ varma_resid_fast = None
 """.strip()
             )
     if "def arma_residuals(" in python:
-        helpers.append(
-            """
-def arma_residuals_fast(x, mu, ar, ma):
-    'Compute ARMA residuals with zero-based Python loops for optimizer callbacks.'
-    x = np.asarray(x, dtype=float)
-    ar = np.asarray(ar, dtype=float).ravel()
-    ma = np.asarray(ma, dtype=float).ravel()
-    y = x - float(mu)
-    e = np.zeros_like(y, dtype=float)
+        arma_impl = """
+def _arma_residuals_fast_impl(x, mu, ar, ma):
+    y = x - mu
+    n = len(y)
+    e = np.zeros(n)
     p = len(ar)
     q = len(ma)
-    n = len(y)
     for t in range(n):
         ar_part = 0.0
         for i in range(p):
@@ -1939,7 +1943,41 @@ def arma_residuals_fast(x, mu, ar, ma):
         e[t] = y[t] - ar_part - ma_part
     return e
 """.strip()
-        )
+        if use_numba:
+            helpers.append(
+                f"""
+try:
+    from numba import njit as _arma_njit
+except Exception:
+    _arma_njit = None
+
+
+{arma_impl}
+
+
+_arma_residuals_fast = _arma_njit(cache=True)(_arma_residuals_fast_impl) if _arma_njit is not None else _arma_residuals_fast_impl
+
+
+def arma_residuals_fast(x, mu, ar, ma):
+    x = np.asarray(x, dtype=float)
+    ar = np.asarray(ar, dtype=float).ravel()
+    ma = np.asarray(ma, dtype=float).ravel()
+    return _arma_residuals_fast(x, float(mu), ar, ma)
+""".strip()
+            )
+        else:
+            helpers.append(
+                f"""
+{arma_impl}
+
+
+def arma_residuals_fast(x, mu, ar, ma):
+    x = np.asarray(x, dtype=float)
+    ar = np.asarray(ar, dtype=float).ravel()
+    ma = np.asarray(ma, dtype=float).ravel()
+    return _arma_residuals_fast_impl(x, float(mu), ar, ma)
+""".strip()
+            )
     if "def nagarch_var(" in python:
         nagarch_impl = """
 def _nagarch_var_fast_impl(eps, omega, alpha, beta, theta):
@@ -2370,10 +2408,13 @@ def optim(par, fn, method="BFGS", control=None, **kwargs):
         method=method,
         options=options,
     )
+    status = int(getattr(result, "status", 1))
+    finite_result = np.all(np.isfinite(result.x)) and np.isfinite(result.fun)
+    convergence = 0 if result.success or (status == 2 and finite_result) else status
     return SimpleNamespace(
         par=result.x,
         value=float(result.fun),
-        convergence=0 if result.success else int(getattr(result, "status", 1)),
+        convergence=convergence,
     )
 """.strip()
         )
@@ -2869,7 +2910,11 @@ def translate_statement(line: str) -> list[str]:
             col_names = f"r_c({', '.join(cols)})"
             row = f"(r_which_min(np.where({cond}, r_subset({mat}, slice(None), r_col_key({mat}, {criterion!r}, globals().get('{mat}_colnames'))), np.inf)) - 1)"
             col = f"np.array([r_col_key({mat}, _col, globals().get('{mat}_colnames')) for _col in np.ravel({col_names})])"
-            return [f"{lhs} = RNamedVector(r_subset({mat}, {row}, {col}), list({col_names}))"]
+            values = f"r_subset({mat}, {row}, {col})"
+            literal_cols = [col[1:-1] for col in cols if is_string_literal(col)]
+            if literal_cols and len(literal_cols) == len(cols) and all("order" in col for col in literal_cols):
+                values = f"np.asarray({values}, dtype=int)"
+            return [f"{lhs} = RNamedVector({values}, list({col_names}))"]
         py_rhs = translate_expr(rhs)
         if lhs in {"aic_order", "bic_order"}:
             criterion = lhs.split("_", 1)[0]
@@ -5994,6 +6039,7 @@ def is_program_specific_runtime_block(block: list[str]) -> bool:
         token in text
         for token in (
             "_nagarch_var_fast_impl",
+            "_arma_residuals_fast_impl",
             "nagarch_var_fast",
             "arma_residuals_fast",
             "varma_resid_fast",
