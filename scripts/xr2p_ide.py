@@ -148,7 +148,9 @@ class Xr2pIde:
         ttk.Button(toolbar, text="Open R", command=self.open_source).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="Save R", command=self.save_source).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(toolbar, text="Save Python", command=self.save_python).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Button(toolbar, text="Clear Code", command=self.clear_code).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Button(toolbar, text="Translate", command=self.translate_current).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="Run R", command=self.run_r_current).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(toolbar, text="Translate + Run", command=lambda: self.translate_current(run_mode="run")).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(toolbar, text="Run Both", command=lambda: self.translate_current(run_mode="run-both")).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(toolbar, text="Diff", command=lambda: self.translate_current(run_mode="run-diff")).pack(side=tk.LEFT, padx=(4, 12))
@@ -277,6 +279,13 @@ class Xr2pIde:
         self.set_text(self.py_output_text, "")
         self.elapsed_r_var.set("R: ")
         self.elapsed_py_var.set("Python: ")
+
+    def clear_code(self) -> None:
+        self.set_text(self.r_text, "")
+        self.set_text(self.py_text, "")
+        self.current_python = ""
+        self.current_out_path = None
+        self.status_var.set("Code cleared")
 
     def show_single_output(self) -> None:
         self.output_mode = "single"
@@ -425,6 +434,32 @@ class Xr2pIde:
         self.clear_output()
         threading.Thread(target=self._translate_worker, args=(source, run_mode), daemon=True).start()
 
+    def run_r_current(self) -> None:
+        source = self.source_text()
+        if not source.strip():
+            self.status_var.set("No R source to run")
+            return
+        self.status_var.set("Running R...")
+        self.show_single_output()
+        self.clear_output()
+        threading.Thread(target=self._run_r_worker, args=(source,), daemon=True).start()
+
+    def _run_r_worker(self, source: str) -> None:
+        with tempfile.TemporaryDirectory(prefix="xr2p_ide_r_") as tmp:
+            tmpdir = Path(tmp)
+            source_name = self.source_path.name if self.source_path is not None else "xr2p_session.r"
+            r_path = tmpdir / source_name
+            r_path.write_text(source, encoding="utf-8")
+            cwd = self.source_path.parent if self.source_path is not None else tmpdir
+            result = run_command([*shlex.split(self.rscript), str(r_path)], cwd=cwd, timeout=self.timeout())
+            self.root.after(0, lambda: self.finish_run_r(result))
+
+    def finish_run_r(self, result: CommandResult) -> None:
+        self.elapsed_r_var.set(f"R: {result.elapsed:.3f}s")
+        self.set_text(self.output_text, format_process_output(result))
+        state = "OK" if result.returncode == 0 else f"exit={result.returncode}"
+        self.status_var.set(f"R {state} in {result.elapsed:.3f}s")
+
     def _translate_worker(self, source: str, run_mode: str | None) -> None:
         with tempfile.TemporaryDirectory(prefix="xr2p_ide_") as tmp:
             tmpdir = Path(tmp)
@@ -457,8 +492,9 @@ class Xr2pIde:
             r_result = None
             py_result = None
             if run_mode == "run-both" and result.returncode == 0 and py_path.exists():
-                r_result = run_command([*shlex.split(self.rscript), str(r_path)], cwd=tmpdir, timeout=self.timeout())
-                py_result = run_command([sys.executable, str(py_path)], cwd=tmpdir, timeout=self.timeout())
+                run_cwd = self.source_path.parent if self.source_path is not None else tmpdir
+                r_result = run_command([*shlex.split(self.rscript), str(r_path)], cwd=run_cwd, timeout=self.timeout())
+                py_result = run_command([sys.executable, str(py_path)], cwd=run_cwd, timeout=self.timeout())
             ide_result = IdeResult(result, python, py_path if py_path.exists() else None, run_mode, r_result, py_result)
             self.root.after(0, lambda: self.finish_translate(ide_result))
 
