@@ -131,6 +131,8 @@ class Xr2pIde:
         self.status_var = tk.StringVar(value="Ready")
         self.elapsed_r_var = tk.StringVar(value="R: ")
         self.elapsed_py_var = tk.StringVar(value="Python: ")
+        self.r_output_label_var = tk.StringVar(value="R output")
+        self.py_output_label_var = tk.StringVar(value="Python output")
         self.output_mode = "single"
         self.text_widgets: list[tk.Text] = []
 
@@ -193,9 +195,9 @@ class Xr2pIde:
         self.r_output_frame = ttk.Frame(self.output_pane)
         self.py_output_frame = ttk.Frame(self.output_pane)
         self.output_text = self.text_widget(self.single_output_frame, height=10)
-        ttk.Label(self.r_output_frame, text="R output").pack(anchor="w")
+        ttk.Label(self.r_output_frame, textvariable=self.r_output_label_var).pack(anchor="w")
         self.r_output_text = self.text_widget(self.r_output_frame, height=10)
-        ttk.Label(self.py_output_frame, text="Python output").pack(anchor="w")
+        ttk.Label(self.py_output_frame, textvariable=self.py_output_label_var).pack(anchor="w")
         self.py_output_text = self.text_widget(self.py_output_frame, height=10)
         self.show_single_output()
 
@@ -279,6 +281,8 @@ class Xr2pIde:
         self.set_text(self.py_output_text, "")
         self.elapsed_r_var.set("R: ")
         self.elapsed_py_var.set("Python: ")
+        self.r_output_label_var.set("R output")
+        self.py_output_label_var.set("Python output")
 
     def clear_code(self) -> None:
         self.set_text(self.r_text, "")
@@ -509,9 +513,13 @@ class Xr2pIde:
             py_text = ""
             if ide_result.r_result is not None:
                 self.elapsed_r_var.set(f"R: {ide_result.r_result.elapsed:.3f}s")
+                self.r_output_label_var.set(f"R output ({ide_result.r_result.elapsed:.3f}s)")
                 r_text = format_process_output(ide_result.r_result)
             if ide_result.py_result is not None:
                 self.elapsed_py_var.set(f"Python: {ide_result.py_result.elapsed:.3f}s")
+                self.py_output_label_var.set(
+                    f"Python output ({ide_result.py_result.elapsed:.3f}s, transpile {result.elapsed:.3f}s)"
+                )
                 py_text = format_process_output(ide_result.py_result)
             self.set_text(self.r_output_text, r_text)
             self.set_text(self.py_output_text, py_text)
