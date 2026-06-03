@@ -1345,6 +1345,13 @@ def r_matrix_index_set(x, idx, value):
         vals = np.resize(np.asarray(value), arr.shape[0])
         x[arr[:, 0].astype(int) - 1, arr[:, 1].astype(int) - 1] = vals
         return x
+    if "RNamedVector" in globals() and isinstance(x, RNamedVector):
+        key = np.asarray(idx)
+        if key.dtype.kind in {"U", "S", "O"}:
+            values = np.resize(np.asarray(value), key.size)
+            for name, val in zip(key.ravel(), values):
+                x[str(name)] = val
+            return x
     key = np.asarray(idx)
     if key.dtype == bool:
         x[key] = value
@@ -2747,6 +2754,13 @@ def translate_statement(line: str) -> list[str]:
         if tibble_call is not None and tibble_call[0].lower() in {"tibble", "tibble_row"} and re.match(r"^[A-Za-z]\w*$", lhs):
             return translate_tibble_assignment(r_name(lhs), tibble_call[1])
         py_rhs = translate_expr(rhs)
+        if lhs in {"aic_order", "bic_order"}:
+            criterion = lhs.split("_", 1)[0]
+            py_rhs = re.sub(
+                r"r_col_key\(([A-Za-z]\w*),\s*['\"]\1_colnames['\"],\s*globals\(\)\.get\(['\"]\1_colnames['\"]\)\)",
+                lambda m: f"r_col_key({m.group(1)}, {criterion!r}, globals().get('{m.group(1)}_colnames'))",
+                py_rhs,
+            )
         double_subscript_assign = re.match(r"^([A-Za-z]\w*)\[\[(.*)\]\]$", lhs)
         if double_subscript_assign:
             base, index = double_subscript_assign.groups()
@@ -2765,7 +2779,10 @@ def translate_statement(line: str) -> list[str]:
             if py_base in NAMED_VECTOR_VARS and re.match(r"^[A-Za-z_]\w*$", index.strip()):
                 return [f"{py_base}[{translate_expr(index)}] = {py_rhs}"]
             return [f"{py_base} = r_matrix_index_set({py_base}, {translate_expr(index)}, {py_rhs})"]
-        if lhs.endswith("_order") and re.search(r"_colnames\.index\([\"']order[\"']\)", py_rhs):
+        if lhs.endswith("_order") and (
+            re.search(r"_colnames\.index\([\"']order[\"']\)", py_rhs)
+            or re.search(r"r_col_key\([^)]*,\s*[\"']order[\"']", py_rhs)
+        ):
             py_rhs = f"int({py_rhs})"
         if (
             lhs.endswith(("_p", "_q"))
@@ -2775,8 +2792,10 @@ def translate_statement(line: str) -> list[str]:
             py_rhs = f"int({py_rhs})"
         as_matrix_subset = re.match(r"as\.matrix\s*\(\s*([A-Za-z]\w*)\s*\[\s*,\s*(.+)\]\s*\)\s*$", rhs, re.IGNORECASE)
         if as_matrix_subset:
-            _, col_expr = as_matrix_subset.groups()
-            return [f"{lhs} = {py_rhs}", f"{lhs}_colnames = list({translate_expr(col_expr)})"]
+            _, raw_cols = as_matrix_subset.groups()
+            col_parts = [part.strip() for part in split_subscript_args("," + raw_cols) if part.strip() and not is_subscript_option(part.strip())]
+            if col_parts:
+                return [f"{lhs} = {py_rhs}", f"{lhs}_colnames = list({translate_expr(col_parts[0])})"]
         return [f"{lhs} = {py_rhs}"]
 
     return [translate_expr(line)]
@@ -2828,7 +2847,7 @@ def translate_metadata_assignment(line: str) -> list[str] | None:
             return [f"{py_obj} = ({py_obj}.values if isinstance({py_obj}, RNamedVector) else {py_obj})"]
         NAMED_VECTOR_VARS.add(py_obj)
         return [f"{py_obj} = RNamedVector({py_obj}, list({translate_expr(rhs)}))"]
-    if not re.match(r"c\s*\(", rhs.strip(), re.IGNORECASE):
+    if not is_character_vector_expr(rhs):
         return ["pass  # R metadata assignment omitted"]
     suffix = "colnames" if kind.lower() == "colnames" else "rownames"
     return [f"{r_name(obj)}_{suffix} = list({translate_expr(rhs)})"]
@@ -3205,7 +3224,7 @@ def replace_named_matrix_columns(expr: str) -> str:
     str_atom = r"(?:[\"'][^\"']+[\"']|__R_STR_\d+__)"
     expr = re.sub(
         rf"\b([A-Za-z]\w*)\[:,\s*\(({str_atom})\)\s*-\s*1\]",
-        lambda m: f"{m.group(1)}[:, {m.group(1)}_colnames.index({m.group(2)})]",
+        lambda m: f"{m.group(1)}[:, r_col_key({m.group(1)}, {m.group(2)}, globals().get('{m.group(1)}_colnames'))]",
         expr,
     )
     expr = re.sub(
@@ -3215,17 +3234,17 @@ def replace_named_matrix_columns(expr: str) -> str:
     )
     expr = re.sub(
         rf"\b([A-Za-z]\w*)\[([^\[\]]+?),\s*({str_atom})\]",
-        lambda m: f"{m.group(1)}[{m.group(2)}, {m.group(1)}_colnames.index({m.group(3)})]",
+        lambda m: f"{m.group(1)}[{m.group(2)}, r_col_key({m.group(1)}, {m.group(3)}, globals().get('{m.group(1)}_colnames'))]",
         expr,
     )
     expr = re.sub(
         rf"\b([A-Za-z]\w*)\[\(([A-Za-z]\w*_idx)\)\s*-\s*1,\s*\(({str_atom})\)\s*-\s*1\]",
-        lambda m: f"int({m.group(1)}[{m.group(2)}, {m.group(1)}_colnames.index({m.group(3)})])",
+        lambda m: f"int({m.group(1)}[{m.group(2)}, r_col_key({m.group(1)}, {m.group(3)}, globals().get('{m.group(1)}_colnames'))])",
         expr,
     )
     expr = re.sub(
         rf"\b([A-Za-z]\w*)\[([^\[\]]+?),\s*\(({str_atom})\)\s*-\s*1\]",
-        lambda m: f"{m.group(1)}[{m.group(2)}, {m.group(1)}_colnames.index({m.group(3)})]",
+        lambda m: f"{m.group(1)}[{m.group(2)}, r_col_key({m.group(1)}, {m.group(3)}, globals().get('{m.group(1)}_colnames'))]",
         expr,
     )
     expr = re.sub(
@@ -3503,10 +3522,10 @@ def is_character_vector_expr(text: str) -> bool:
     if raw_call is None:
         return False
     name = raw_call[0].lower()
-    if name in {"setdiff", "names", "colnames", "rownames", "as.character"}:
+    if name in {"setdiff", "names", "colnames", "rownames", "as.character", "paste", "paste0"}:
         return True
     if name == "c":
-        return all(is_string_literal(arg.strip()) for arg in raw_call[1])
+        return any(is_character_vector_expr(arg.strip()) for arg in raw_call[1])
     return False
 
 
