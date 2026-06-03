@@ -1912,6 +1912,34 @@ else:
 varma_resid_fast = None
 """.strip()
             )
+    if "def arma_residuals(" in python:
+        helpers.append(
+            """
+def arma_residuals_fast(x, mu, ar, ma):
+    'Compute ARMA residuals with zero-based Python loops for optimizer callbacks.'
+    x = np.asarray(x, dtype=float)
+    ar = np.asarray(ar, dtype=float).ravel()
+    ma = np.asarray(ma, dtype=float).ravel()
+    y = x - float(mu)
+    e = np.zeros_like(y, dtype=float)
+    p = len(ar)
+    q = len(ma)
+    n = len(y)
+    for t in range(n):
+        ar_part = 0.0
+        for i in range(p):
+            lag = t - i - 1
+            if lag >= 0:
+                ar_part += ar[i] * y[lag]
+        ma_part = 0.0
+        for i in range(q):
+            lag = t - i - 1
+            if lag >= 0:
+                ma_part += ma[i] * e[lag]
+        e[t] = y[t] - ar_part - ma_part
+    return e
+""".strip()
+        )
     if "def nagarch_var(" in python:
         nagarch_impl = """
 def _nagarch_var_fast_impl(eps, omega, alpha, beta, theta):
@@ -2364,6 +2392,15 @@ def optim(par, fn, method="BFGS", control=None, **kwargs):
 
 
 def inject_known_fast_paths(python: str) -> str:
+    if "def arma_residuals(" in python and "return arma_residuals_fast(" not in python:
+        python = python.replace(
+            "def arma_residuals(x, mu, ar, ma):\n",
+            (
+                "def arma_residuals(x, mu, ar, ma):\n"
+                "    return arma_residuals_fast(x, mu, ar, ma)\n"
+            ),
+            1,
+        )
     if "def varma_resid(" in python and "varma_resid_fast is not None" not in python:
         python = python.replace(
             "def varma_resid(x, par, p, q, start_order):\n",
@@ -5958,6 +5995,7 @@ def is_program_specific_runtime_block(block: list[str]) -> bool:
         for token in (
             "_nagarch_var_fast_impl",
             "nagarch_var_fast",
+            "arma_residuals_fast",
             "varma_resid_fast",
         )
     )
@@ -6053,7 +6091,7 @@ def is_runtime_helper_binding(name: str) -> bool:
     return (
         name.startswith("_")
         or name.endswith("_fast")
-        or name in {"njit", "varma_resid_fast", "nagarch_var_fast"}
+        or name in {"njit", "arma_residuals_fast", "varma_resid_fast", "nagarch_var_fast"}
     )
 
 
