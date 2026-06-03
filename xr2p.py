@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,7 @@ USER_FUNCTION_PARAMS: dict[str, list[str]] = {}
 PENDING_FUNCTION_PARAMS: list[str] | None = None
 NAMED_VECTOR_VARS: set[str] = set()
 DOTTED_R_VARS: set[str] = set()
+CHARACTER_VECTOR_VARS: set[str] = set()
 
 
 @dataclass
@@ -43,12 +45,16 @@ def translate_source(source: str, *, use_numba: bool = True) -> str:
     USER_FUNCTION_PARAMS.clear()
     NAMED_VECTOR_VARS.clear()
     DOTTED_R_VARS.clear()
+    CHARACTER_VECTOR_VARS.clear()
     global PENDING_FUNCTION_PARAMS
     PENDING_FUNCTION_PARAMS = None
     out = ["import numpy as np", ""]
     indent = 0
     for line in logical_r_lines(preprocess_simple_inline_r(source)):
         if not line:
+            continue
+        if line.startswith("#"):
+            out.append(INDENT * indent + line)
             continue
         while line.startswith("}"):
             indent = max(indent - 1, 0)
@@ -2316,6 +2322,9 @@ def logical_r_lines(source: str) -> list[str]:
     current: list[str] = []
     depth = 0
     for original in source.splitlines():
+        if not current and original.lstrip().startswith("#"):
+            lines.append(original.lstrip())
+            continue
         line = strip_r_comment(original).strip()
         if not line:
             continue
@@ -3000,6 +3009,12 @@ def split_assignment(line: str) -> tuple[str, str] | None:
             base_lhs = lhs.split("[", 1)[0]
             if "." in base_lhs:
                 DOTTED_R_VARS.add(base_lhs)
+            if "[" not in lhs:
+                py_lhs = r_name(base_lhs)
+                if is_character_vector_expr(rhs):
+                    CHARACTER_VECTOR_VARS.add(py_lhs)
+                else:
+                    CHARACTER_VECTOR_VARS.discard(py_lhs)
             return translate_expr(lhs), rhs
     return None
 
@@ -3443,6 +3458,8 @@ def is_newline_literal(text: str) -> bool:
 
 def is_string_index_expr(text: str) -> bool:
     text = strip_outer_parens(text.strip())
+    if r_name(text) in CHARACTER_VECTOR_VARS:
+        return True
     if is_string_literal(text):
         return True
     if re.fullmatch(r"__R_STR_\d+__", text):
@@ -3455,6 +3472,23 @@ def is_string_index_expr(text: str) -> bool:
     if raw_call[0].lower() != "c":
         return False
     return all(re.fullmatch(r"__R_STR_\d+__", arg.strip()) or is_string_literal(arg.strip()) for arg in raw_call[1])
+
+
+def is_character_vector_expr(text: str) -> bool:
+    text = strip_outer_parens(text.strip())
+    if is_string_literal(text):
+        return True
+    if r_name(text) in CHARACTER_VECTOR_VARS:
+        return True
+    raw_call = parse_full_call(text)
+    if raw_call is None:
+        return False
+    name = raw_call[0].lower()
+    if name in {"setdiff", "names", "colnames", "rownames", "as.character"}:
+        return True
+    if name == "c":
+        return all(is_string_literal(arg.strip()) for arg in raw_call[1])
+    return False
 
 
 def is_subscript_option(item: str) -> bool:
@@ -3687,22 +3721,24 @@ def translate_call(name: str, args: list[str]) -> str:
     if lname == "rbind":
         return translate_rbind_call(args)
     if lname == "print":
-        if len(args) == 1:
-            raw_call = parse_full_call(args[0])
+        print_args = positional_args(args)
+        print_py_args = [translate_expr(arg) for arg in print_args]
+        if len(print_args) == 1:
+            raw_call = parse_full_call(print_args[0])
             if raw_call is not None and raw_call[0].lower() == "round" and len(raw_call[1]) >= 2:
                 return (
                     "r_print("
-                    + py_args[0]
+                    + print_py_args[0]
                     + ", digits="
                     + translate_expr(raw_call[1][1])
                     + print_colnames_arg(raw_call[1][0], allow_simple=True)
                     + ")"
                 )
-            colnames_arg = print_colnames_arg(args[0], allow_simple=True)
+            colnames_arg = print_colnames_arg(print_args[0], allow_simple=True)
             if colnames_arg:
-                return "r_print(" + py_args[0] + colnames_arg + ")"
-            return "r_s3_print(" + py_args[0] + ")"
-        return "r_print(" + ", ".join(py_args) + ")"
+                return "r_print(" + print_py_args[0] + colnames_arg + ")"
+            return "r_s3_print(" + print_py_args[0] + ")"
+        return "r_print(" + ", ".join(print_py_args) + ")"
     if lname == "cat":
         if args and is_newline_literal(args[-1].strip()):
             if len(py_args) == 1:
@@ -4762,6 +4798,9 @@ def translate_quantile_call(args: list[str]) -> str:
     x = translate_expr(args[0])
     probs_arg = keyword_arg(args, "probs", default=args[1] if len(positional_args(args)) > 1 else "np.array([0.0, 0.25, 0.5, 0.75, 1.0])")
     probs = translate_expr(probs_arg)
+    names_arg = keyword_arg(args, "names", default="True")
+    if translate_expr(names_arg) == "False":
+        return f"np.quantile({x}, {probs})"
     return f"(lambda _p: RNamedVector(np.quantile({x}, _p), [f'{{100 * v:g}}%' for v in _p]))({probs})"
 
 
@@ -5494,6 +5533,428 @@ def remove_py_compile_artifacts(path: Path) -> None:
         pass
 
 
+def slim_python(python: str) -> str:
+    try:
+        tree = ast.parse(python)
+    except SyntaxError:
+        return python
+
+    removable = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and is_generated_helper_name(node.name)
+    }
+    if not removable:
+        return python
+
+    needed = ast_used_names_excluding_removable_top_level(tree, set(removable))
+    changed = True
+    while changed:
+        changed = False
+        for name, node in removable.items():
+            if name not in needed:
+                continue
+            before = len(needed)
+            needed.update(ast_used_names(node))
+            changed = len(needed) != before
+
+    remove_ranges: list[tuple[int, int]] = []
+    for name, node in removable.items():
+        if name not in needed:
+            end = getattr(node, "end_lineno", node.lineno)
+            remove_ranges.append((node.lineno, end))
+    if not remove_ranges:
+        return remove_unused_import_statements(python)
+
+    slimmed = remove_line_ranges(python, remove_ranges)
+    slimmed = collapse_excess_blank_lines(slimmed)
+    return remove_unused_import_statements(slimmed)
+
+
+def split_runtime_module(python: str, module_name: str = "xr2p_runtime") -> tuple[str, str, set[str]]:
+    try:
+        tree = ast.parse(python)
+    except SyntaxError:
+        return python, "", set()
+
+    move_ranges: list[tuple[int, int]] = []
+    runtime_names: set[str] = set()
+    import_end = 0
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            import_end = max(import_end, getattr(node, "end_lineno", node.lineno))
+            continue
+        if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+            break
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and is_generated_helper_name(node.name):
+            move_ranges.append((node.lineno, getattr(node, "end_lineno", node.lineno)))
+            runtime_names.add(node.name)
+            continue
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.Try)):
+            names = assigned_names(node)
+            if names and all(is_runtime_helper_binding(name) for name in names):
+                move_ranges.append((node.lineno, getattr(node, "end_lineno", node.lineno)))
+                runtime_names.update(names)
+
+    if not move_ranges:
+        return python, "", set()
+
+    lines = python.splitlines()
+    runtime_lines: list[str] = []
+    if import_end:
+        runtime_lines.extend(lines[:import_end])
+        runtime_lines.append("")
+    runtime_lines.extend(runtime_module_header())
+    runtime_lines.append("")
+    generic_blocks: list[list[str]] = []
+    specific_blocks: list[list[str]] = []
+    for start, end in sorted(move_ranges):
+        block = lines[start - 1:end]
+        block = add_runtime_docstring(block)
+        if is_program_specific_runtime_block(block):
+            specific_blocks.append(block)
+        else:
+            generic_blocks.append(block)
+    for block in generic_blocks:
+        runtime_lines.extend(block)
+        runtime_lines.append("")
+    if specific_blocks:
+        runtime_lines.extend(program_specific_runtime_header())
+        runtime_lines.append("")
+        for block in specific_blocks:
+            runtime_lines.extend(block)
+            runtime_lines.append("")
+
+    main = remove_line_ranges(python, move_ranges)
+    try:
+        main_used_names = ast_used_names(ast.parse(main))
+        runtime_names = runtime_names.intersection(main_used_names)
+    except SyntaxError:
+        pass
+    main_lines = main.splitlines()
+    insert_at = 0
+    while insert_at < len(main_lines):
+        stripped = main_lines[insert_at].strip()
+        if stripped.startswith(("import ", "from ")):
+            insert_at += 1
+            continue
+        break
+    main_lines[insert_at:insert_at] = format_runtime_import(module_name, runtime_names)
+    main = collapse_excess_blank_lines("\n".join(main_lines).rstrip() + "\n")
+    runtime = collapse_excess_blank_lines("\n".join(runtime_lines).rstrip() + "\n")
+    return main, runtime, runtime_names
+
+
+def prune_runtime_module(runtime: str, required_names: set[str]) -> str:
+    try:
+        tree = ast.parse(runtime)
+    except SyntaxError:
+        return runtime
+
+    defined: dict[str, ast.AST] = {}
+    owner_by_name: dict[str, ast.AST] = {}
+    for node in tree.body:
+        names: set[str] = set()
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.Try)):
+            names.update(assigned_names(node))
+        for name in names:
+            defined[name] = node
+            owner_by_name[name] = node
+
+    keep_names = set(required_names)
+    changed = True
+    while changed:
+        changed = False
+        for name in list(keep_names):
+            node = defined.get(name)
+            if node is None:
+                continue
+            for used in ast_used_names(node):
+                if used in defined and used not in keep_names:
+                    keep_names.add(used)
+                    changed = True
+
+    keep_nodes = {owner_by_name[name] for name in keep_names if name in owner_by_name}
+    remove_ranges: list[tuple[int, int]] = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Assign, ast.AnnAssign, ast.Try)):
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                names = {node.name}
+            else:
+                names = assigned_names(node)
+            if names and node not in keep_nodes and not any(name in keep_names for name in names):
+                remove_ranges.append((node.lineno, getattr(node, "end_lineno", node.lineno)))
+    if not remove_ranges:
+        return runtime
+    pruned = remove_line_ranges(runtime, remove_ranges)
+    pruned = collapse_excess_blank_lines(pruned)
+    return remove_unused_import_statements(pruned)
+
+
+def format_runtime_import(module_name: str, names: set[str]) -> list[str]:
+    public_names = sorted(name for name in names if name and not name.startswith("__"))
+    if not public_names:
+        return []
+    if len(public_names) <= 4 and sum(len(name) for name in public_names) <= 60:
+        return [f"from {module_name} import " + ", ".join(public_names)]
+    lines = [f"from {module_name} import ("]
+    lines.extend(f"    {name}," for name in public_names)
+    lines.append(")")
+    return lines
+
+
+def runtime_module_header() -> list[str]:
+    return [
+        '"""Runtime helpers for Python files generated by xr2p.py.',
+        "",
+        "This module implements small R-compatibility shims used by translated scripts.",
+        "It is generated on demand by `xr2p.py --runtime-module` and can be refreshed",
+        "with `--update-runtime`.",
+        '"""',
+    ]
+
+
+def program_specific_runtime_header() -> list[str]:
+    return [
+        "# Program-specific generated helpers",
+        "# These helpers are emitted for specialized translations and are not part",
+        "# of the stable xr2p runtime API.",
+    ]
+
+
+def is_program_specific_runtime_block(block: list[str]) -> bool:
+    text = "\n".join(block)
+    return any(
+        token in text
+        for token in (
+            "_nagarch_var_fast_impl",
+            "nagarch_var_fast",
+            "varma_resid_fast",
+        )
+    )
+
+
+RUNTIME_DOCSTRINGS = {
+    "RList": "Simple namespace used to represent R lists with optional element names.",
+    "RNamedVector": "Array-like container that preserves R vector names through common operations.",
+    "r_print": "Print values using compact R-like formatting for vectors, matrices, and data frames.",
+    "r_s3_print": "Dispatch print methods for simple translated S3-style objects.",
+    "r_subset": "Return an R-style subset of arrays, data frames, lists, or named vectors.",
+    "r_set_subset": "Assign into an R-style subset and return the modified object.",
+    "r_vec_subset": "Return a one-dimensional R-style vector subset.",
+    "r_matrix_index_get": "Return an R-style one-based vector or matrix element/subset.",
+    "r_matrix_index_set": "Assign an R-style one-based vector or matrix element/subset.",
+    "r_data_frame": "Build a pandas DataFrame from translated R data.frame arguments.",
+    "r_df_col": "Convert an R-like value into a one-dimensional DataFrame column.",
+    "r_c": "Concatenate translated R vector arguments while preserving optional names.",
+    "r_list_get": "Return an R-style list element using one-based numeric or named indexing.",
+    "r_names": "Return R-style names for vectors, lists, data frames, or named metadata.",
+    "r_setdiff": "Return values in x that are not present in y, preserving order.",
+    "r_recycle_binary": "Apply a binary NumPy operation with simple R-style vector recycling.",
+    "r_add": "Add values with simple R-style recycling and date handling.",
+    "r_sub": "Subtract values with simple R-style recycling.",
+    "r_mul": "Multiply values with simple R-style recycling.",
+    "r_div": "Divide values with simple R-style recycling.",
+    "r_length": "Return R-style length for common translated containers.",
+    "r_range": "Return an inclusive Python range matching R sequence loop endpoints.",
+    "r_seq": "Return an inclusive NumPy sequence matching R's colon operator.",
+    "r_as_date": "Convert strings or arrays to pandas datetime values.",
+    "r_diff": "Return first differences, using rows as the matrix axis.",
+    "tail_py": "Return the last n elements or rows.",
+    "head_py": "Return the first n elements or rows.",
+    "var_r": "Return R-compatible sample variance or covariance.",
+}
+
+
+def add_runtime_docstring(block: list[str]) -> list[str]:
+    if not block:
+        return block
+    first = block[0]
+    match = re.match(r"^(class|def)\s+([A-Za-z_]\w*)\b.*:\s*$", first)
+    if match is None:
+        return block
+    name = match.group(2)
+    doc = RUNTIME_DOCSTRINGS.get(name)
+    if not doc:
+        return block
+    if len(block) > 1 and re.match(r'\s+"""', block[1]):
+        return block
+    indent = "    "
+    return [block[0], f'{indent}"""{doc}"""', *block[1:]]
+
+
+def is_generated_helper_name(name: str) -> bool:
+    if name.startswith("_nagarch_"):
+        return True
+    if name.startswith(("r_", "R")):
+        return True
+    if name.endswith("_py"):
+        return True
+    return name in {
+        "TryError",
+        "source",
+        "date",
+        "q",
+        "quit",
+        "message",
+        "warning",
+        "time_ctime",
+        "var_r",
+        "sd",
+        "cov",
+        "cor",
+        "sort",
+        "order",
+        "rank",
+        "table",
+        "tapply",
+        "lapply",
+        "sapply",
+        "mapply",
+        "split",
+        "unsplit",
+        "Reduce",
+        "rep_int",
+        "match_fun",
+    }
+
+
+def is_runtime_helper_binding(name: str) -> bool:
+    return (
+        name.startswith("_")
+        or name.endswith("_fast")
+        or name in {"njit", "varma_resid_fast", "nagarch_var_fast"}
+    )
+
+
+def assigned_names(node: ast.AST) -> set[str]:
+    names: set[str] = set()
+    targets: list[ast.AST] = []
+    if isinstance(node, ast.Assign):
+        targets.extend(node.targets)
+    elif isinstance(node, ast.AnnAssign):
+        targets.append(node.target)
+    elif isinstance(node, ast.Try):
+        for child in ast.walk(node):
+            if isinstance(child, ast.Assign):
+                targets.extend(child.targets)
+            elif isinstance(child, ast.AnnAssign):
+                targets.append(child.target)
+            elif isinstance(child, ast.Import):
+                names.update(alias.asname or alias.name.split(".")[0] for alias in child.names)
+            elif isinstance(child, ast.ImportFrom):
+                names.update(alias.asname or alias.name for alias in child.names)
+    for target in targets:
+        for child in ast.walk(target):
+            if isinstance(child, ast.Name):
+                names.add(child.id)
+    return names
+
+
+def ast_used_names(node: ast.AST) -> set[str]:
+    return {child.id for child in ast.walk(node) if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)}
+
+
+def ast_used_names_excluding_removable_top_level(tree: ast.Module, removable: set[str]) -> set[str]:
+    used: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in removable:
+            continue
+        used.update(ast_used_names(node))
+    return used
+
+
+def remove_line_ranges(source: str, ranges: list[tuple[int, int]]) -> str:
+    remove: set[int] = set()
+    for start, end in ranges:
+        remove.update(range(start, end + 1))
+    lines = source.splitlines()
+    kept = [line for i, line in enumerate(lines, start=1) if i not in remove]
+    return "\n".join(kept).rstrip() + "\n"
+
+
+def collapse_excess_blank_lines(source: str) -> str:
+    lines = source.splitlines()
+    out: list[str] = []
+    blank_count = 0
+    for line in lines:
+        if line.strip():
+            blank_count = 0
+            out.append(line)
+        else:
+            blank_count += 1
+            if blank_count <= 2:
+                out.append(line)
+    return "\n".join(out).rstrip() + "\n"
+
+
+def remove_unused_import_statements(source: str) -> str:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+    import_lines: dict[int, set[str]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            import_lines[node.lineno] = {alias.asname or alias.name.split(".")[0] for alias in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            import_lines[node.lineno] = {alias.asname or alias.name for alias in node.names}
+    if not import_lines:
+        return source
+    used: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            used.add(node.id)
+    remove_lines = [lineno for lineno, names in import_lines.items() if names.isdisjoint(used)]
+    if not remove_lines:
+        return source
+    return remove_line_ranges(source, [(lineno, lineno) for lineno in remove_lines])
+
+
+def compile_python_text(python: str, *, suffix: str = ".py") -> subprocess.CompletedProcess[str]:
+    with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False, encoding="utf-8") as handle:
+        handle.write(python)
+        path = Path(handle.name)
+    try:
+        return check_python_compile(path)
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def runtime_module_is_compatible(existing: str, generated: str) -> bool:
+    try:
+        existing_tree = ast.parse(existing)
+        generated_tree = ast.parse(generated)
+    except SyntaxError:
+        return False
+    existing_names = top_level_defined_names(existing_tree)
+    generated_names = top_level_defined_names(generated_tree)
+    return generated_names.issubset(existing_names)
+
+
+def top_level_defined_names(tree: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.Try)):
+            names.update(assigned_names(node))
+        elif isinstance(node, ast.Import):
+            names.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.update(alias.asname or alias.name for alias in node.names)
+    return names
+
+
 def count_code_lines(source: str) -> int:
     return sum(1 for line in source.splitlines() if line.strip() and not line.lstrip().startswith("#"))
 
@@ -5505,6 +5966,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tee", action="store_true", help="print the emitted Python code")
     parser.add_argument("--tee-both", action="store_true", help="print the original R source and emitted Python code")
     parser.add_argument("--loc", action="store_true", help="print nonblank, noncomment line counts for R source and Python output")
+    parser.add_argument("--lean", action="store_true", help="try to remove unused generated helpers; fall back if slimmed code does not compile")
+    parser.add_argument("--runtime-module", action="store_true", help="move generated runtime helpers to xr2p_runtime.py and import them")
+    parser.add_argument("--prune-runtime", action="store_true", help="with --runtime-module, keep only runtime helpers needed by the generated script")
+    parser.add_argument("--update-runtime", action="store_true", help="overwrite xr2p_runtime.py when --runtime-module is used")
     parser.add_argument("--no-numba", action="store_true", help="do not emit generated code that imports or uses numba")
     parser.add_argument("--no-py-compile", action="store_true", help="skip python -m py_compile check")
     parser.add_argument("--run", action="store_true", help="run the generated Python")
@@ -5566,6 +6031,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.run_diff and args.stats:
         print("Option conflict: --run-diff and --stats cannot be used together.")
         return 1
+    if args.prune_runtime:
+        args.runtime_module = True
+    if args.update_runtime and not args.runtime_module:
+        print("Option error: --update-runtime requires --runtime-module.")
+        return 1
 
     if args.time:
         args.run = True
@@ -5592,14 +6062,57 @@ def main(argv: list[str] | None = None) -> int:
         print(f"xr2p: {exc}", file=sys.stderr)
         return 1
 
+    if args.lean:
+        slimmed = slim_python(python)
+        if slimmed != python:
+            lean_compile = compile_python_text(slimmed)
+            if lean_compile.returncode == 0:
+                python = slimmed
+            else:
+                print("warning: --lean output failed syntax check; wrote unslimmed translation", file=sys.stderr)
+
     out = args.out or args.source.with_suffix(".py")
+    runtime_python = ""
+    runtime_path: Path | None = None
+    runtime_written = False
+    if args.runtime_module:
+        runtime_path = out.parent / "xr2p_runtime.py"
+        python, runtime_python, runtime_import_names = split_runtime_module(python, runtime_path.stem)
+        if args.prune_runtime and runtime_python:
+            pruned_runtime = prune_runtime_module(runtime_python, runtime_import_names)
+            if pruned_runtime != runtime_python:
+                prune_compile = compile_python_text(pruned_runtime)
+                if prune_compile.returncode == 0:
+                    runtime_python = pruned_runtime
+                else:
+                    print("warning: --prune-runtime output failed syntax check; using full runtime module", file=sys.stderr)
+        runtime_needs_update = args.update_runtime or not runtime_path.exists()
+        if runtime_python and runtime_path.exists() and not runtime_needs_update:
+            existing_runtime = runtime_path.read_text(encoding="utf-8", errors="replace")
+            if not runtime_module_is_compatible(existing_runtime, runtime_python):
+                print("warning: existing runtime module is incompatible; updating xr2p_runtime.py", file=sys.stderr)
+                runtime_needs_update = True
+        if runtime_python and runtime_needs_update:
+            runtime_path.write_text(runtime_python, encoding="utf-8")
+            runtime_written = True
     out.write_text(python, encoding="utf-8")
     print(f"wrote {out}")
+    if runtime_path is not None and runtime_python:
+        print(f"runtime module: {runtime_path}")
     if args.time or args.time_both:
         print(f"Transpile time: {translate_elapsed:.3f}s")
     if args.loc:
-        print(f"Lines of code (R): {count_code_lines(source)}")
-        print(f"Lines of code (Python): {count_code_lines(python)}")
+        r_loc = count_code_lines(source)
+        py_loc = count_code_lines(python)
+        if args.runtime_module and runtime_path is not None:
+            runtime_source = runtime_python if runtime_written or not runtime_path.exists() else runtime_path.read_text(encoding="utf-8", errors="replace")
+            runtime_loc = count_code_lines(runtime_source)
+            total_py_loc = py_loc + runtime_loc
+            ratio = total_py_loc / r_loc if r_loc else float("inf")
+            print(f"lines of code: R={r_loc} Python={py_loc} runtime={runtime_loc} total Python={total_py_loc} total Python/R={ratio:.3g}")
+        else:
+            ratio = py_loc / r_loc if r_loc else float("inf")
+            print(f"lines of code: R={r_loc} Python={py_loc} Python/R={ratio:.3g}")
     if args.tee_both:
         print("R source:")
         print(source, end="" if source.endswith("\n") else "\n")
@@ -5623,16 +6136,12 @@ def main(argv: list[str] | None = None) -> int:
         r_result = run_r(args.source, args.rscript)
         r_elapsed = time.perf_counter() - r_start
         print("Run (R):", "PASS" if r_result.returncode == 0 else f"FAIL exit={r_result.returncode}")
-        if args.time_both:
-            print(f"Run (R time): {r_elapsed:.3f}s")
         print_result_output(r_result, r_round_digits, pretty_r=args.pretty, flush_left=args.flush_left, squeeze=args.squeeze)
         print("Run (Python):", sys.executable, out)
         py_start = time.perf_counter()
         py_result = run_python(out)
         py_elapsed = time.perf_counter() - py_start
         print("Run (Python):", "PASS" if py_result.returncode == 0 else f"FAIL exit={py_result.returncode}")
-        if args.time_both:
-            print(f"Run (Python time): {py_elapsed:.3f}s")
         print_result_output(py_result, python_round_digits, flush_left=args.flush_left, squeeze=args.squeeze)
         if args.run_diff:
             compare_digits = args.round_both if args.round_both is not None else args.round
@@ -5646,6 +6155,10 @@ def main(argv: list[str] | None = None) -> int:
             if not same:
                 print("Run (diff):", "FAIL")
                 print(diff)
+                if args.time_both:
+                    ratio = py_elapsed / r_elapsed if r_elapsed else float("inf")
+                    print()
+                    print(f"run times: R={r_elapsed:.3f}s Python={py_elapsed:.3f}s Python/R={ratio:.3g}")
                 return 1
             print("Run (diff):", "PASS")
         if args.stats:
@@ -5657,8 +6170,16 @@ def main(argv: list[str] | None = None) -> int:
             if not same:
                 print("Stats:", "FAIL")
                 print(detail)
+                if args.time_both:
+                    ratio = py_elapsed / r_elapsed if r_elapsed else float("inf")
+                    print()
+                    print(f"run times: R={r_elapsed:.3f}s Python={py_elapsed:.3f}s Python/R={ratio:.3g}")
                 return 1
             print("Stats:", "PASS")
+        if args.time_both:
+            ratio = py_elapsed / r_elapsed if r_elapsed else float("inf")
+            print()
+            print(f"run times: R={r_elapsed:.3f}s Python={py_elapsed:.3f}s Python/R={ratio:.3g}")
         return 0 if r_result.returncode == 0 and py_result.returncode == 0 else 1
     if args.run:
         py_start = time.perf_counter()
