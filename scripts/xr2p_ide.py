@@ -56,6 +56,8 @@ class IdeResult:
     run_mode: str | None
     r_result: CommandResult | None = None
     py_result: CommandResult | None = None
+    runtime_python: str = ""
+    runtime_path: Path | None = None
 
 
 def read_text(path: Path) -> str:
@@ -113,6 +115,10 @@ def format_process_output(result: CommandResult) -> str:
     return "\n".join(parts)
 
 
+def count_code_lines(source: str) -> int:
+    return sum(1 for line in source.splitlines() if line.strip() and not line.lstrip().startswith("#"))
+
+
 class Xr2pIde:
     def __init__(self, root: tk.Tk, *, xr2p: Path, rscript: str, source: Path | None = None) -> None:
         self.root = root
@@ -121,6 +127,8 @@ class Xr2pIde:
         self.source_path = source
         self.current_python = ""
         self.current_out_path: Path | None = None
+        self.current_runtime_python = ""
+        self.current_runtime_path: Path | None = None
 
         self.timeout_var = tk.StringVar(value="30")
         self.round_var = tk.StringVar(value="")
@@ -128,9 +136,17 @@ class Xr2pIde:
         self.pretty_var = tk.BooleanVar(value=True)
         self.no_compile_var = tk.BooleanVar(value=False)
         self.autocomplete_var = tk.BooleanVar(value=True)
+        self.lean_var = tk.BooleanVar(value=False)
+        self.runtime_module_var = tk.BooleanVar(value=False)
+        self.prune_runtime_var = tk.BooleanVar(value=False)
+        self.refresh_runtime_var = tk.BooleanVar(value=False)
+        self.no_numba_var = tk.BooleanVar(value=False)
+        self.show_times_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Ready")
         self.elapsed_r_var = tk.StringVar(value="R: ")
         self.elapsed_py_var = tk.StringVar(value="Python: ")
+        self.r_source_label_var = tk.StringVar(value="R source (0 LOC)")
+        self.py_source_label_var = tk.StringVar(value="Generated Python (0 LOC)")
         self.r_output_label_var = tk.StringVar(value="R output")
         self.py_output_label_var = tk.StringVar(value="Python output")
         self.output_mode = "single"
@@ -147,28 +163,39 @@ class Xr2pIde:
         toolbar = ttk.Frame(self.root, padding=(6, 4))
         toolbar.pack(side=tk.TOP, fill=tk.X)
 
-        ttk.Button(toolbar, text="Open R", command=self.open_source).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="Save R", command=self.save_source).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Button(toolbar, text="Save Python", command=self.save_python).pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Button(toolbar, text="Clear Code", command=self.clear_code).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Button(toolbar, text="Translate", command=self.translate_current).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="Run R", command=self.run_r_current).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Button(toolbar, text="Translate + Run", command=lambda: self.translate_current(run_mode="run")).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Button(toolbar, text="Run Both", command=lambda: self.translate_current(run_mode="run-both")).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Button(toolbar, text="Diff", command=lambda: self.translate_current(run_mode="run-diff")).pack(side=tk.LEFT, padx=(4, 12))
+        action_bar = ttk.Frame(toolbar)
+        action_bar.pack(side=tk.TOP, fill=tk.X)
+        option_bar = ttk.Frame(toolbar)
+        option_bar.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
 
-        ttk.Label(toolbar, text="Timeout").pack(side=tk.LEFT)
-        ttk.Entry(toolbar, width=5, textvariable=self.timeout_var).pack(side=tk.LEFT, padx=(2, 8))
-        ttk.Label(toolbar, text="Round").pack(side=tk.LEFT)
-        ttk.Entry(toolbar, width=5, textvariable=self.round_var).pack(side=tk.LEFT, padx=(2, 8))
-        ttk.Label(toolbar, text="Font").pack(side=tk.LEFT)
-        font_spin = ttk.Spinbox(toolbar, from_=8, to=24, width=4, textvariable=self.font_size_var, command=self.update_text_fonts)
+        ttk.Button(action_bar, text="Open R", command=self.open_source).pack(side=tk.LEFT)
+        ttk.Button(action_bar, text="Save R", command=self.save_source).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(action_bar, text="Save Python", command=self.save_python).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Button(action_bar, text="Clear Code", command=self.clear_code).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(action_bar, text="Translate", command=self.translate_current).pack(side=tk.LEFT)
+        ttk.Button(action_bar, text="Run R", command=self.run_r_current).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(action_bar, text="Translate + Run", command=lambda: self.translate_current(run_mode="run")).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(action_bar, text="Run Both", command=lambda: self.translate_current(run_mode="run-both")).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(action_bar, text="Diff", command=lambda: self.translate_current(run_mode="run-diff")).pack(side=tk.LEFT, padx=(4, 0))
+
+        ttk.Label(option_bar, text="Timeout").pack(side=tk.LEFT)
+        ttk.Entry(option_bar, width=5, textvariable=self.timeout_var).pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Label(option_bar, text="Round").pack(side=tk.LEFT)
+        ttk.Entry(option_bar, width=5, textvariable=self.round_var).pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Label(option_bar, text="Font").pack(side=tk.LEFT)
+        font_spin = ttk.Spinbox(option_bar, from_=8, to=24, width=4, textvariable=self.font_size_var, command=self.update_text_fonts)
         font_spin.pack(side=tk.LEFT, padx=(2, 8))
         font_spin.bind("<Return>", lambda _event: self.update_text_fonts())
         font_spin.bind("<FocusOut>", lambda _event: self.update_text_fonts())
-        ttk.Checkbutton(toolbar, text="Pretty R", variable=self.pretty_var).pack(side=tk.LEFT)
-        ttk.Checkbutton(toolbar, text="No compile", variable=self.no_compile_var).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Checkbutton(toolbar, text="Autocomplete", variable=self.autocomplete_var).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Checkbutton(option_bar, text="Pretty R", variable=self.pretty_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(option_bar, text="No compile", variable=self.no_compile_var).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Checkbutton(option_bar, text="Autocomplete", variable=self.autocomplete_var).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Checkbutton(option_bar, text="Lean", variable=self.lean_var).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Checkbutton(option_bar, text="Runtime module", variable=self.runtime_module_var).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Checkbutton(option_bar, text="Prune runtime", variable=self.prune_runtime_var, command=self.on_prune_runtime_toggle).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Checkbutton(option_bar, text="Refresh runtime", variable=self.refresh_runtime_var).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Checkbutton(option_bar, text="No numba", variable=self.no_numba_var).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Checkbutton(option_bar, text="Show times", variable=self.show_times_var).pack(side=tk.LEFT, padx=(4, 0))
 
         pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         pane.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
@@ -178,10 +205,10 @@ class Xr2pIde:
         pane.add(left, weight=1)
         pane.add(right, weight=1)
 
-        ttk.Label(left, text="R source").pack(anchor="w")
+        ttk.Label(left, textvariable=self.r_source_label_var).pack(anchor="w")
         self.r_text = self.text_widget(left)
 
-        ttk.Label(right, text="Generated Python").pack(anchor="w")
+        ttk.Label(right, textvariable=self.py_source_label_var).pack(anchor="w")
         self.py_text = self.text_widget(right)
 
         output_frame = ttk.Frame(self.root, padding=(6, 0, 6, 4))
@@ -213,6 +240,10 @@ class Xr2pIde:
         self.r_text.bind("<<Modified>>", lambda _event: self.on_text_modified(self.r_text, "r"))
         self.py_text.bind("<<Modified>>", lambda _event: self.on_text_modified(self.py_text, "python"))
         self.r_text.bind("<KeyPress>", self.r_autocomplete)
+
+    def on_prune_runtime_toggle(self) -> None:
+        if self.prune_runtime_var.get():
+            self.runtime_module_var.set(True)
 
     def text_widget(self, parent: tk.Widget, *, height: int | None = None) -> tk.Text:
         frame = ttk.Frame(parent)
@@ -284,11 +315,23 @@ class Xr2pIde:
         self.r_output_label_var.set("R output")
         self.py_output_label_var.set("Python output")
 
+    def update_code_labels(self) -> None:
+        self.r_source_label_var.set(f"R source ({count_code_lines(self.source_text())} LOC)")
+        py_loc = count_code_lines(self.py_text.get("1.0", "end-1c"))
+        runtime_loc = count_code_lines(self.current_runtime_python)
+        if runtime_loc:
+            self.py_source_label_var.set(f"Generated Python ({py_loc} LOC), runtime ({runtime_loc} LOC)")
+        else:
+            self.py_source_label_var.set(f"Generated Python ({py_loc} LOC)")
+
     def clear_code(self) -> None:
         self.set_text(self.r_text, "")
         self.set_text(self.py_text, "")
         self.current_python = ""
         self.current_out_path = None
+        self.current_runtime_python = ""
+        self.current_runtime_path = None
+        self.update_code_labels()
         self.status_var.set("Code cleared")
 
     def show_single_output(self) -> None:
@@ -318,6 +361,7 @@ class Xr2pIde:
             return
         widget.edit_modified(False)
         self.highlight(widget, language)
+        self.update_code_labels()
 
     def r_autocomplete(self, event: tk.Event) -> str | None:
         if not self.autocomplete_var.get():
@@ -400,6 +444,7 @@ class Xr2pIde:
         self.source_path = path
         self.set_text(self.r_text, read_text(path))
         self.highlight(self.r_text, "r")
+        self.update_code_labels()
         self.root.title(f"xr2p IDE - {path}")
         self.status_var.set(f"Loaded {path}")
 
@@ -422,8 +467,14 @@ class Xr2pIde:
         initial = self.source_path.with_suffix(".py").name if self.source_path is not None else "xr2p_output.py"
         selected = filedialog.asksaveasfilename(title="Save Python", filetypes=PY_FILETYPES, defaultextension=".py", initialfile=initial)
         if selected:
-            Path(selected).write_text(self.current_python, encoding="utf-8")
-            self.status_var.set(f"Saved {selected}")
+            selected_path = Path(selected)
+            selected_path.write_text(self.current_python, encoding="utf-8")
+            if self.current_runtime_python:
+                runtime_path = selected_path.parent / "xr2p_runtime.py"
+                runtime_path.write_text(self.current_runtime_python, encoding="utf-8")
+                self.status_var.set(f"Saved {selected_path} and {runtime_path.name}")
+            else:
+                self.status_var.set(f"Saved {selected_path}")
 
     def translate_current(self, *, run_mode: str | None = None) -> None:
         source = self.source_text()
@@ -475,12 +526,22 @@ class Xr2pIde:
             command = [sys.executable, str(self.xr2p), str(r_path), "-o", str(py_path)]
             if self.no_compile_var.get():
                 command.append("--no-py-compile")
+            if self.lean_var.get():
+                command.append("--lean")
+            if self.prune_runtime_var.get():
+                command.append("--prune-runtime")
+            elif self.runtime_module_var.get():
+                command.append("--runtime-module")
+            if self.refresh_runtime_var.get() and (self.runtime_module_var.get() or self.prune_runtime_var.get()):
+                command.append("--update-runtime")
+            if self.no_numba_var.get():
+                command.append("--no-numba")
             cli_run_mode = run_mode
             if run_mode == "run-both":
                 cli_run_mode = None
 
             if cli_run_mode == "run":
-                command.append("--run")
+                command.append("--time" if self.show_times_var.get() else "--run")
             elif cli_run_mode == "run-diff":
                 command.append("--run-diff")
             if cli_run_mode in {"run-diff"} and self.pretty_var.get():
@@ -493,21 +554,35 @@ class Xr2pIde:
 
             result = run_command(command, cwd=tmpdir, timeout=self.timeout())
             python = py_path.read_text(encoding="utf-8", errors="replace") if py_path.exists() else ""
+            runtime_path = py_path.parent / "xr2p_runtime.py"
+            runtime_python = runtime_path.read_text(encoding="utf-8", errors="replace") if runtime_path.exists() else ""
             r_result = None
             py_result = None
             if run_mode == "run-both" and result.returncode == 0 and py_path.exists():
                 run_cwd = self.source_path.parent if self.source_path is not None else tmpdir
                 r_result = run_command([*shlex.split(self.rscript), str(r_path)], cwd=run_cwd, timeout=self.timeout())
                 py_result = run_command([sys.executable, str(py_path)], cwd=run_cwd, timeout=self.timeout())
-            ide_result = IdeResult(result, python, py_path if py_path.exists() else None, run_mode, r_result, py_result)
+            ide_result = IdeResult(
+                result,
+                python,
+                py_path if py_path.exists() else None,
+                run_mode,
+                r_result,
+                py_result,
+                runtime_python,
+                runtime_path if runtime_path.exists() else None,
+            )
             self.root.after(0, lambda: self.finish_translate(ide_result))
 
     def finish_translate(self, ide_result: IdeResult) -> None:
         result = ide_result.command_result
         self.current_python = ide_result.python
         self.current_out_path = ide_result.out_path
+        self.current_runtime_python = ide_result.runtime_python
+        self.current_runtime_path = ide_result.runtime_path
         self.set_text(self.py_text, ide_result.python)
         self.highlight(self.py_text, "python")
+        self.update_code_labels()
         if ide_result.run_mode == "run-both":
             r_text = ""
             py_text = ""
@@ -536,7 +611,10 @@ class Xr2pIde:
             if ide_result.run_mode == "run":
                 self.elapsed_py_var.set(f"Python: {result.elapsed:.3f}s")
         state = "OK" if result.returncode == 0 else f"exit={result.returncode}"
-        self.status_var.set(f"xr2p {state} in {result.elapsed:.3f}s")
+        if ide_result.runtime_path is not None:
+            self.status_var.set(f"xr2p {state} in {result.elapsed:.3f}s; runtime {ide_result.runtime_path.name}")
+        else:
+            self.status_var.set(f"xr2p {state} in {result.elapsed:.3f}s")
 
     def show_help(self) -> None:
         messagebox.showinfo(
