@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -5507,7 +5508,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-numba", action="store_true", help="do not emit generated code that imports or uses numba")
     parser.add_argument("--no-py-compile", action="store_true", help="skip python -m py_compile check")
     parser.add_argument("--run", action="store_true", help="run the generated Python")
+    parser.add_argument("--time", action="store_true", help="run the generated Python and print transpilation and run elapsed times")
     parser.add_argument("--run-both", action="store_true", help="run original R and generated Python")
+    parser.add_argument("--time-both", action="store_true", help="run original R and generated Python and print transpilation and run elapsed times")
     parser.add_argument(
         "--run-diff",
         action="store_true",
@@ -5564,6 +5567,11 @@ def main(argv: list[str] | None = None) -> int:
         print("Option conflict: --run-diff and --stats cannot be used together.")
         return 1
 
+    if args.time:
+        args.run = True
+    if args.time_both:
+        args.run_both = True
+
     if args.run_diff or args.stats:
         args.run_both = True
 
@@ -5577,7 +5585,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         source = args.source.read_text(encoding="utf-8-sig")
+        translate_start = time.perf_counter()
         python = translate_source(source, use_numba=not args.no_numba)
+        translate_elapsed = time.perf_counter() - translate_start
     except (OSError, R2PyError) as exc:
         print(f"xr2p: {exc}", file=sys.stderr)
         return 1
@@ -5585,6 +5595,8 @@ def main(argv: list[str] | None = None) -> int:
     out = args.out or args.source.with_suffix(".py")
     out.write_text(python, encoding="utf-8")
     print(f"wrote {out}")
+    if args.time or args.time_both:
+        print(f"Transpile time: {translate_elapsed:.3f}s")
     if args.loc:
         print(f"Lines of code (R): {count_code_lines(source)}")
         print(f"Lines of code (Python): {count_code_lines(python)}")
@@ -5607,12 +5619,20 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.run_both:
         print("Run (R):", args.rscript, args.source)
+        r_start = time.perf_counter()
         r_result = run_r(args.source, args.rscript)
+        r_elapsed = time.perf_counter() - r_start
         print("Run (R):", "PASS" if r_result.returncode == 0 else f"FAIL exit={r_result.returncode}")
+        if args.time_both:
+            print(f"Run (R time): {r_elapsed:.3f}s")
         print_result_output(r_result, r_round_digits, pretty_r=args.pretty, flush_left=args.flush_left, squeeze=args.squeeze)
         print("Run (Python):", sys.executable, out)
+        py_start = time.perf_counter()
         py_result = run_python(out)
+        py_elapsed = time.perf_counter() - py_start
         print("Run (Python):", "PASS" if py_result.returncode == 0 else f"FAIL exit={py_result.returncode}")
+        if args.time_both:
+            print(f"Run (Python time): {py_elapsed:.3f}s")
         print_result_output(py_result, python_round_digits, flush_left=args.flush_left, squeeze=args.squeeze)
         if args.run_diff:
             compare_digits = args.round_both if args.round_both is not None else args.round
@@ -5641,7 +5661,11 @@ def main(argv: list[str] | None = None) -> int:
             print("Stats:", "PASS")
         return 0 if r_result.returncode == 0 and py_result.returncode == 0 else 1
     if args.run:
+        py_start = time.perf_counter()
         result = run_python(out)
+        py_elapsed = time.perf_counter() - py_start
+        if args.time:
+            print(f"Run (Python time): {py_elapsed:.3f}s")
         print_result_output(result, python_round_digits, flush_left=args.flush_left, squeeze=args.squeeze)
         return result.returncode
     return 0
