@@ -1,22 +1,22 @@
 # R-to-Python
 
-`xr2p.py` is an experimental source-to-source transpiler from a practical
-subset of R to Python.  It is aimed at numerical scripts, simulation examples,
-small data-analysis programs, and regression fixtures rather than full general
-R compatibility.
+`xr2p.py` is an experimental source-to-source transpiler from a practical subset
+of R to Python. It is aimed at numerical scripts, simulation examples, small
+data-analysis programs, and regression fixtures rather than full general R
+compatibility.
 
-The generated Python is designed to run directly.  It primarily targets NumPy,
-with pandas, SciPy, statsmodels, and scikit-learn used for features where those
-libraries are a closer match to R behavior.
+The generated Python is designed to run directly. It primarily targets NumPy,
+with pandas, SciPy, statsmodels, scikit-learn, and optional numba used where
+those libraries are a closer match to R behavior or performance needs.
 
 ## Status
 
-This project is actively evolving.  It supports many common R constructs, but
-it is not a complete R interpreter or a drop-in replacement for R.
+This project is actively evolving. It supports many common R constructs, but it
+is not a complete R interpreter or a drop-in replacement for R.
 
-The transpiler works best on small, self-contained `.r` scripts that use base R
-features.  Package-heavy code, advanced non-standard evaluation, and complex R
-object systems may require additional translator work.
+The transpiler works best on small, self-contained `.r` scripts using base R and
+straightforward numerical code. Package-heavy code, advanced non-standard
+evaluation, and complex R object systems may require additional translator work.
 
 ## Quick start
 
@@ -64,6 +64,59 @@ Skip Python syntax checking:
 python xr2p.py fixtures\xseq.r --no-py-compile
 ```
 
+## Useful command-line options
+
+Show nonblank, noncomment lines of code for R and Python:
+
+```bat
+python xr2p.py fixtures\xseq.r --loc
+```
+
+Run Python with transpilation and run time displayed:
+
+```bat
+python xr2p.py fixtures\xseq.r --time
+```
+
+Run both R and Python with timing:
+
+```bat
+python xr2p.py fixtures\xseq.r --time-both
+```
+
+Try to remove unused generated helpers from the output:
+
+```bat
+python xr2p.py fixtures\xseq.r --lean
+```
+
+Move generated runtime helpers into `xr2p_runtime.py`:
+
+```bat
+python xr2p.py fixtures\xseq.r --runtime-module
+```
+
+Keep only needed runtime helpers in that module:
+
+```bat
+python xr2p.py fixtures\xseq.r --runtime-module --prune-runtime
+```
+
+Refresh an existing runtime module:
+
+```bat
+python xr2p.py fixtures\xseq.r --runtime-module --update-runtime
+```
+
+Disable generated numba fast paths:
+
+```bat
+python xr2p.py fixtures\xseq.r --no-numba
+```
+
+`--lean` and `--prune-runtime` check that the slimmed output still compiles. If
+not, `xr2p.py` falls back to the safer unslimmed output and prints a warning.
+
 ## Output comparison options
 
 Run both R and Python and show a unified output diff:
@@ -97,6 +150,15 @@ Round numeric output before comparison:
 python xr2p.py fixtures\xseq.r --run-diff --round-both 6
 ```
 
+Make displayed output easier to compare visually:
+
+```bat
+python xr2p.py fixtures\xseq.r --run-both --flush-left --squeeze
+```
+
+`--flush-left` strips leading whitespace from displayed lines. `--squeeze`
+collapses runs of two or more spaces to one space.
+
 ## Optional GUI
 
 A small Tkinter GUI is available:
@@ -111,17 +173,27 @@ Open an R file directly:
 python scripts\xr2p_ide.py fixtures\xseq.r
 ```
 
-The GUI is a thin wrapper around `xr2p.py`.  It provides R source and generated
-Python panes, syntax highlighting, optional autocomplete, adjustable font size,
-timing displays for R and Python runs, and buttons for translate, run Python,
-run both R/Python, and diff.
+The GUI is a thin wrapper around `xr2p.py`. It provides:
+
+- R source and generated Python panes.
+- Separate R and Python output panes for Run Both.
+- Syntax highlighting for R and Python.
+- Optional autocomplete for R editing.
+- Adjustable font size.
+- Clear buttons for source and generated code panes.
+- Timing displays for R, Python, and transpilation.
+- Line-of-code displays for R and generated Python.
+- Checkboxes for `--lean`, `--runtime-module`, `--prune-runtime`, `--pretty`,
+  `--no-numba`, and related run options.
+- Buttons for translate, Run R, Run Python, Run Both, and diff.
 
 ## Supported feature areas
 
 Support is partial, but the current translator covers a broad base-R subset:
 
 - Assignments with `<-`, `=`, and selected `<<-` cases.
-- Scalar and vector arithmetic with R-style recycling.
+- Scalar and vector arithmetic with R-style recycling where needed, while using
+  ordinary Python operators for simple numeric expressions.
 - Vectors, named vectors, and name-based indexing/assignment.
 - R 1-based indexing, logical indexing, negative indexing, and matrix
   coordinate indexing.
@@ -132,37 +204,39 @@ Support is partial, but the current translator covers a broad base-R subset:
 - Matrices and arrays with R column-major ordering.
 - `cbind`, `rbind`, row/column sums and means, `apply`, `sweep`, `outer`,
   `diag`, `lower.tri`, `upper.tri`, `crossprod`, and `tcrossprod`.
-- pandas-backed `data.frame`, subsetting, filtering, modification, `merge`,
-  `aggregate`, `stack`, and `unstack`.
+- pandas-backed `data.frame`, tibble-style construction for common cases,
+  subsetting, filtering, modification, `merge`, `aggregate`, `stack`, and
+  `unstack`.
 - Factors, `table`, `tapply`, ordering, sorting, ranking, `unique`,
-  `duplicated`, `match`, and `%in%`.
-- Missing/infinite values: `NA`, `NaN`, `Inf`, `is.na`, `is.nan`,
-  `is.finite`, and `is.infinite`.
+  `duplicated`, `match`, `setdiff`, and `%in%`.
+- Missing/infinite values: `NA`, typed `NA_*` constants, `NaN`, `Inf`,
+  `is.na`, `is.nan`, `is.finite`, `is.infinite`, and `complete.cases`.
 - Strings and regex helpers including `paste`, `paste0`, `sprintf`, `substr`,
   `grep`, `grepl`, `sub`, `gsub`, and `regexpr`.
-- Dates and simple time series helpers.
-- Random generators and distribution functions using NumPy/SciPy where
-  appropriate.
+- Dates, date sequences, date formatting, and simple time series helpers.
+- Random generators and distribution `d`, `p`, and `q` functions using
+  NumPy/SciPy where appropriate.
 - Basic modeling/statistics helpers including `lm`, `glm` binomial, `aov`,
   `model.matrix`, `prcomp`, `kmeans`, `arima`, `cor`, `cov`, `eigen`, `svd`,
-  and `qr`.
-- File I/O helpers for CSV, lines, simple text connections, and RDS-like
-  pickle-backed save/load.
-- Minimal S3-style class, attributes, `UseMethod`, `try`, `tryCatch`,
-  `stop`, `warning`, `message`, and `capture.output`.
+  `qr`, `polyroot`, `uniroot`, and `integrate`.
+- File I/O helpers for CSV, tables, lines, simple text connections, and
+  pickle-backed RDS-like save/load.
+- Minimal S3-style class, attributes, `UseMethod`, `try`, `tryCatch`, `stop`,
+  `warning`, `message`, and `capture.output`.
 
 ## Dependencies
 
-Core translation uses Python's standard library.  Generated Python may require:
+Core translation uses Python's standard library. Generated Python may require:
 
 - NumPy
 - pandas
 - SciPy
 - statsmodels
 - scikit-learn
+- numba, optional, for selected generated fast paths
 
-R is only needed for `--run-both`, `--run-diff`, `--stats`, or tests that
-compare against `rscript`.
+R is only needed for `--run-both`, `--time-both`, `--run-diff`, `--stats`, or
+tests that compare against `rscript`.
 
 ## Tests
 
@@ -179,16 +253,16 @@ The tests include:
 - Compile checks for selected fixture scripts.
 - Runtime smoke tests for deterministic fixture scripts.
 
-Some fixtures are exploratory examples.  Not every local `x*.r` file is part of
-the hard pytest contract.
-
-Fixture scripts live in `fixtures/`.  Generated `x*.py` outputs are ignored by
+Fixture scripts live in `fixtures/`. Generated `x*.py` outputs are ignored by
 Git; regenerate them locally when needed.
 
-## Batch checks
+Some fixtures are exploratory examples. Not every local `x*.r` file is part of
+the hard pytest contract.
 
-`xr2p_batch.py` can run translation sweeps over user-provided R files or glob
-patterns:
+## Batch translation checks
+
+`xr2p_batch.py` can run translation sweeps over user-provided R files, glob
+patterns, `@` lists, or directories:
 
 ```bat
 python xr2p_batch.py fixtures\*.r --quiet
@@ -200,6 +274,12 @@ Add syntax checking:
 python xr2p_batch.py fixtures\*.r --quiet --check-syntax
 ```
 
+Run generated Python as well:
+
+```bat
+python xr2p_batch.py fixtures\*.r --run --quiet
+```
+
 Run recursively over a downloaded corpus and save generated Python plus a CSV
 summary:
 
@@ -207,25 +287,84 @@ summary:
 python xr2p_batch.py c:\rcode\public_domain\burkardt --recursive --check-syntax --out-dir c:\temp\xr2p_burkardt --summary-csv c:\temp\xr2p_burkardt\summary.csv --quiet
 ```
 
-Process only the first few expanded inputs while testing a large corpus:
+Useful corpus options include:
 
-```bat
-python xr2p_batch.py c:\rcode\public_domain\burkardt --recursive --limit 25 --check-syntax --quiet
-```
-
-The `--xr2f-pytest-corpus` option is for local development when a separate
-R-to-Fortran checkout is available.
+- `--limit N` to process only the first N expanded inputs.
+- `--skip N` to skip the first N expanded inputs after filtering.
+- `--max-fail N` to stop after N failures.
+- `--only-r-pass CSV` to process only scripts that passed an `xrbatch.py` run.
+- `--only-r-output CSV` to process only scripts that passed R and produced
+  output. This implies the practical intent of `--only-r-pass`.
 
 Failure output includes the generated Python line, nearby generated context,
-and source file path.  Batch runs also print the finish time and elapsed
-seconds.
+and source file path. Batch runs also print the finish time and elapsed seconds.
+The summary CSV includes status and elapsed-time information so unusually slow
+Python translations can be identified.
+
+## Running original R corpora
+
+`xrbatch.py` runs original R scripts without translating them. This is useful
+for deciding which programs are valid R examples before asking `xr2p_batch.py`
+to translate and run them.
+
+Run a recursive R sweep:
+
+```bat
+python xrbatch.py c:\rcode\public_domain\burkardt --recursive --summary-csv burkardt_r_runs.csv
+```
+
+Save stdout and stderr for each R script:
+
+```bat
+python xrbatch.py c:\rcode\public_domain\burkardt --recursive --log-dir c:\temp\r_logs --summary-csv burkardt_r_runs.csv
+```
+
+The `xrbatch.py` CSV records pass/fail status, elapsed time, and stdout size.
+Scripts with no stdout are often library/function files rather than standalone
+programs; `xr2p_batch.py --only-r-output burkardt_r_runs.csv` can use that CSV
+to focus on runnable examples.
+
+## Burkardt-style source paths
+
+Some public R corpora contain absolute `source()` calls that point to the
+author's machine. The repository includes a helper script for rewriting those
+to relative paths in a local corpus copy. Use it on a disposable downloaded
+copy, not on upstream source files you want to keep pristine.
+
+## Performance notes
+
+Generated Python is designed first for understandable, runnable translations.
+Fast Python sometimes requires additional specialization.
+
+`optim()` is a notable case. R code often passes an objective function that uses
+scalar loops and flexible R indexing. Translating that literally can be slow in
+Python because SciPy calls the objective many times, and each call may pass
+through R-compatibility helpers. The transpiler includes fast paths for some
+recognized numerical kernels, such as ARMA residuals, VARMA residuals, and
+NAGARCH variance recursions, but arbitrary `optim()` objectives may still need
+manual vectorization, a custom SciPy formulation, or a new generated fast path.
+
+SciPy optimizer convergence codes also do not map exactly to R `optim()` codes.
+The compatibility wrapper handles common finite precision-loss exits, but
+numerical results and convergence flags can still differ from R.
+
+Use these options when investigating performance or output differences:
+
+```bat
+python xr2p.py script.r --time
+python xr2p.py script.r --time-both --round-both 6
+python xr2p.py script.r --loc --lean --runtime-module --prune-runtime
+```
 
 ## Development notes
 
-The translator is intentionally pragmatic.  Many R constructs are lowered to
-small runtime helper functions emitted into the generated Python file.  This
+The translator is intentionally pragmatic. Many R constructs are lowered to
+small runtime helper functions emitted into the generated Python file. This
 keeps individual translations simple and makes R-specific behavior explicit in
 the output.
+
+When generated files contain too much boilerplate, use `--lean` or
+`--runtime-module --prune-runtime` to separate or reduce the runtime helpers.
 
 When adding support for a new R construct, prefer adding:
 
@@ -244,6 +383,8 @@ Known limitations include:
 - Formatting may differ from R even when numeric results match.
 - Statistical routines may use different algorithms from R and can differ
   numerically.
+- Automatically translated optimization code may be correct but slower than R
+  until inner numerical kernels are specialized.
 
-Use `--pretty`, `--round-both`, and `--stats` when comparing outputs from R and
-Python.
+Use `--pretty`, `--round-both`, `--flush-left`, `--squeeze`, and `--stats` when
+comparing outputs from R and Python.

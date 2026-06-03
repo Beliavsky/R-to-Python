@@ -26,6 +26,7 @@ COMPILE_FIXTURES = [
     "xsimple_naive_bayes.r",
     "xkalman_filter.r",
     "xem_mix_normals.r",
+    "xtibble.r",
 ]
 
 

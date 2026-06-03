@@ -13,6 +13,7 @@ env/
 /x*.py
 !xr2p.py
 !xr2p_batch.py
+!xrbatch.py
 
 # Generated/intermediate Fortran artifacts
 *.mod
@@ -24,6 +25,20 @@ temp_*.txt
 tmp_*.py
 tmp_*.r
 do.txt
+temp.txt
+/#*#
+
+# Local experiment scripts and data in the repository root.
+# Curated R fixtures should live under fixtures/.
+/x*.r
+/x*.R
+/x*.r[0-9]*
+/burkardt_results_*.txt
+/burkardt_r_runs.csv
+/burkardt_r_runs.txt
+/mvnormal_mixture_simulated.csv
+/mvnormal_mixture_simulated.txt
+/spy_tlt.csv
 
 # Personal/local batch scripts
 copyod.bat

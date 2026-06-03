@@ -5,7 +5,30 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from xr2p import translate_source
+from xr2p import flush_left_output, normalize_output, round_numeric_tokens, squeeze_output_spaces, translate_source
+
+
+def test_round_numeric_tokens_leaves_integers_unchanged():
+    out = round_numeric_tokens("iterations = 64\ncounts\n461 292 -247\nx = 1.23456 1e-3", 4)
+    assert "iterations = 64" in out
+    assert "461 292 -247" in out
+    assert "1.2346 0.0010" in out
+
+
+def test_flush_left_output_strips_leading_spaces_per_line():
+    assert flush_left_output("  a\n b\n") == "a\nb\n"
+
+
+def test_normalize_output_can_flush_left_after_rounding():
+    assert normalize_output("  1.23456\n", 4, flush_left=True) == ["1.2346"]
+
+
+def test_squeeze_output_spaces_collapses_runs_of_spaces():
+    assert squeeze_output_spaces("a   b\n  c    d\n") == "a b\n c d\n"
+
+
+def test_normalize_output_can_squeeze_after_rounding():
+    assert normalize_output("  1.23456    2.0\n", 4, squeeze=True) == ["1.2346 2.0000"]
 
 
 def test_vector_loop_translation():
@@ -22,15 +45,143 @@ def test_vector_loop_translation():
     assert "r_print(v" in out
 
 
+def test_full_line_r_comments_are_preserved():
+    out = translate_source("# estimate pi\nx <- 1\n# print result\nprint(x)\n")
+    assert "# estimate pi" in out
+    assert "# print result" in out
+    assert "x = 1" in out
+
+
+def test_simple_numeric_arithmetic_keeps_python_operators():
+    out = translate_source(
+        "inside <- x^2 + y^2 <= 1.0\n"
+        "pi_hat <- 4.0 * mean(inside)\n"
+        "cat(\"error =\", pi_hat - pi, \"\\n\")\n"
+    )
+    assert "inside = x ** 2 + y ** 2 <= 1.0" in out
+    assert "pi_hat = 4.0 * np.mean(inside)" in out
+    assert 'print("error =", pi_hat - pi)' in out
+    assert "def r_recycle_binary" not in out
+
+
+def test_as_character_translates_to_string_array():
+    out = translate_source('dates <- as.Date(as.character(prices$Date), format = "%Y%m%d")\n')
+    assert 'dates = r_as_date(np.asarray(prices.Date, dtype=str), format="%Y%m%d")' in out
+    assert "as_character" not in out
+
+
+def test_setdiff_names_can_select_dataframe_columns():
+    out = translate_source('x <- as.matrix(prices[, setdiff(names(prices), "Date")])\n')
+    assert 'r_subset(prices, slice(None), r_setdiff(r_names(prices), "Date"))' in out
+    assert "r_setdiff" in out
+    assert 'r_setdiff(r_names(prices), "Date") - 1' not in out
+
+
+def test_setdiff_names_variable_can_select_dataframe_columns():
+    out = translate_source('price_names <- setdiff(names(prices), "Date")\nx <- as.matrix(prices[, price_names])\n')
+    assert 'price_names = r_setdiff(r_names(prices), "Date")' in out
+    assert 'r_subset(prices, slice(None), price_names)' in out
+    assert "price_names - 1" not in out
+
+
+def test_as_matrix_dataframe_column_subset_preserves_colnames():
+    out = translate_source('price_mat <- as.matrix(prices[, setdiff(names(prices), "Date")])\n')
+    assert 'price_mat_colnames = list(r_setdiff(r_names(prices), "Date"))' in out
+    assert "asset_names = np.array(globals().get('price_mat_colnames', []))" in translate_source(
+        "asset_names <- colnames(price_mat)\n"
+    )
+
+
+def test_as_matrix_dataframe_column_subset_ignores_drop_option_for_colnames():
+    out = translate_source("price_mat <- as.matrix(prices[, price_names, drop = FALSE])\n")
+    assert "price_mat_colnames = list(price_names)" in out
+    assert "drop = False" not in out
+
+
+def test_matrix_diff_uses_row_axis():
+    out = translate_source("ret <- diff(log_price)\n")
+    assert "def r_diff(x):" in out
+    assert "np.diff(arr, axis=0) if arr.ndim >= 2 else np.diff(arr)" in out
+    assert "ret = r_diff(log_price)" in out
+
+
+def test_cor_use_option_translates_to_helper():
+    out = translate_source('print(cor(ret_mat, use = "pairwise.complete.obs"))\n')
+    assert 'cor_py(ret_mat, use="pairwise.complete.obs")' in out
+    assert "np.corrcoef(ret_mat, use" not in out
+
+
+def test_toeplitz_maps_to_scipy_linalg():
+    out = translate_source("rmat <- toeplitz(acov[1:p])\n")
+    assert "from scipy import linalg" in out
+    assert "rmat = linalg.toeplitz(" in out
+
+
+def test_quantile_names_false_returns_plain_array():
+    out = translate_source("mu <- as.numeric(quantile(x, probs = q, names = FALSE))\n")
+    assert "mu = np.asarray(np.quantile(x, q), dtype=float)" in out
+    assert "lambda_" not in out
+    assert "RNamedVector(np.quantile" not in out
+
+
+def test_nagarch_var_uses_fast_recursion_helper():
+    out = translate_source(
+        "nagarch_var <- function(eps, omega, alpha, beta, theta) {\n"
+        "  n <- length(eps)\n"
+        "  h <- numeric(n)\n"
+        "  h[1] <- var(eps)\n"
+        "  for (i in 2:n) {\n"
+        "    zlag <- eps[i - 1] / sqrt(h[i - 1])\n"
+        "    h[i] <- omega + alpha * h[i - 1] * (zlag - theta)^2 + beta * h[i - 1]\n"
+        "  }\n"
+        "  return(h)\n"
+        "}\n"
+    )
+    assert "def _nagarch_var_fast_impl(" in out
+    assert "return nagarch_var_fast(eps, omega, alpha, beta, theta)" in out
+
+
+def test_no_numba_keeps_nagarch_fast_path_without_numba_import():
+    out = translate_source(
+        "nagarch_var <- function(eps, omega, alpha, beta, theta) {\n"
+        "  n <- length(eps)\n"
+        "  h <- numeric(n)\n"
+        "  h[1] <- var(eps)\n"
+        "  for (i in 2:n) {\n"
+        "    zlag <- eps[i - 1] / sqrt(h[i - 1])\n"
+        "    h[i] <- omega + alpha * h[i - 1] * (zlag - theta)^2 + beta * h[i - 1]\n"
+        "  }\n"
+        "  return(h)\n"
+        "}\n",
+        use_numba=False,
+    )
+    assert "numba" not in out
+    assert "nagarch_var_fast = _nagarch_var_fast_impl" in out
+    assert "return nagarch_var_fast(eps, omega, alpha, beta, theta)" in out
+
+
 def test_matrix_translation_uses_column_major_reshape():
     out = translate_source("x = 1:4\nxmat = matrix(x, 2, 2)\n")
     assert "x = r_seq(1, 4)" in out
-    assert "np.resize(r_matrix_data(x), r_mul(2, 2)).reshape((2, 2), order='F')" in out
+    assert "np.resize(r_matrix_data(x), 2 * 2).reshape((2, 2), order='F')" in out
 
 
 def test_matrix_size_expression_preserves_precedence():
     out = translate_source("xlag <- matrix(NA_real_, nrow = n - p, ncol = p)\n")
     assert "np.resize(r_matrix_data(np.nan), r_mul(r_sub(n, p), p)).reshape((r_sub(n, p), p), order='F')" in out
+
+
+def test_nrow_ncol_inside_matrix_do_not_rewrite_shape_subscripts():
+    out = translate_source("qprime <- t(matrix(rep(q, nrow(p)), ncol(p)))\n")
+    assert "np.tile(np.repeat(q, 1), p.shape[0])" in out
+    assert "reshape((p.shape[1], -1), order='F').T" in out
+    assert "r_matrix_index_get(p.shape" not in out
+
+
+def test_attr_super_assignment_translates_to_set_attr():
+    out = translate_source('attr(abc, "a_default") <<- a_default\n')
+    assert 'r_set_attr(abc, "a_default", a_default)' in out
+    assert "<=" not in out
 
 
 def test_one_line_for_translation():
@@ -196,7 +347,7 @@ def test_parenthesized_range_subscript():
 
 def test_negative_integer_subscript_drops_element():
     out = translate_source("phi <- coef_vec[-1]\n")
-    assert "phi = np.delete(coef_vec, r_sub(1, 1))" in out
+    assert "phi = np.delete(coef_vec, 1 - 1)" in out
 
 
 def test_parenthesized_range_in_for_loop():
@@ -266,7 +417,47 @@ def test_named_matrix_column_lookup_with_variable_row():
         'aic_p <- tab[aic_idx, "p"]\n'
     )
     assert "aic_idx = r_which_min(" in out
-    assert 'aic_p = r_subset(tab, r_sub(aic_idx, 1), r_col_key(tab, "p", globals().get(\'tab_colnames\')))' in out
+    assert 'aic_p = r_subset(tab, aic_idx - 1, r_col_key(tab, "p", globals().get(\'tab_colnames\')))' in out
+
+
+def test_colnames_assignment_accepts_character_vector_variable():
+    out = translate_source('coef_names <- c("order", paste0("phi", 1:2), "aic")\ncolnames(coef_mat) <- coef_names\n')
+    assert "coef_mat_colnames = list(coef_names)" in out
+    assert "pass  # R metadata assignment omitted" not in out
+
+
+def test_nested_named_column_lookup_uses_r_col_key():
+    out = translate_source(
+        'colnames(coef_mat) <- coef_names\n'
+        'aic_order <- coef_mat[which.min(coef_mat[, "aic"]), "order"]\n'
+    )
+    assert "r_col_key(coef_mat, 'aic', globals().get('coef_mat_colnames'))" in out
+    assert 'r_col_key(coef_mat, "order", globals().get(\'coef_mat_colnames\'))' in out
+    assert "coef_mat_colnames_index" not in out
+
+
+def test_order_selection_from_named_column_is_cast_to_int():
+    out = translate_source('aic_order <- coef_mat[which.min(coef_mat[, "aic"]), "order"]\n')
+    assert "aic_order = int(" in out
+
+
+def test_named_vector_character_assignment_uses_runtime_helper():
+    out = translate_source('names(y) <- c("phi1", "phi2")\ny[paste0("phi", 1:2)] <- z\n')
+    assert "def r_matrix_index_set(x, idx, value):" in out
+    assert "isinstance(x, RNamedVector)" in out
+    assert "x[str(name)] = val" in out
+
+
+def test_order_decreasing_argument_is_preserved():
+    out = translate_source("ord <- order(fit$prob, decreasing = TRUE)\n")
+    assert "def r_order(x, decreasing=False):" in out
+    assert "ord = r_order(fit.prob, decreasing=True)" in out
+
+
+def test_member_assignment_uses_setattr_not_dotted_assignment():
+    out = translate_source("fit$prob <- fit$prob[ord]\n")
+    assert "setattr(fit, 'prob', r_matrix_index_get(r_member(fit, 'prob'), ord))" in out
+    assert "fit_prob" not in out
 
 
 def test_named_matrix_column_lookup_inside_list_result():
@@ -283,6 +474,12 @@ def test_names_assignment_is_omitted_as_metadata():
     out = translate_source('names(phi) <- paste0("phi", 1:p)\n')
     assert "phi = RNamedVector(phi, list(" in out
     assert "names(phi)" not in out
+
+
+def test_names_null_assignment_clears_named_vector_metadata():
+    out = translate_source("names(beta) <- NULL\n")
+    assert "beta = (beta.values if isinstance(beta, RNamedVector) else beta)" in out
+    assert "list(None)" not in out
 
 
 def test_cbind_named_columns_translates_to_column_stack():
@@ -307,9 +504,21 @@ def test_list_result_carries_column_names_for_printing():
     assert "colnames=getattr(out, 'table_colnames', None)" in out
 
 
+def test_print_row_names_option_is_ignored():
+    out = translate_source("print(out, row.names = FALSE)\n")
+    assert "r_print(out" in out
+    assert "row_names" not in out
+
+
 def test_tail_one_returns_last_element():
     out = translate_source("print(tail(x, 1))\n")
-    assert "x[-1]" in out
+    assert "tail_py(x, 1)" in out
+
+
+def test_tail_one_does_not_become_negative_r_subscript():
+    out = translate_source('cat("last =", as.character(tail(ret_dates, 1)), "\\n")\n')
+    assert "tail_py(ret_dates, 1)" in out
+    assert "np.delete(ret_dates" not in out
 
 
 def test_blank_line_after_function_block():
@@ -351,13 +560,13 @@ def test_matrix_subscripts_and_apply_helpers():
 
 def test_drop_false_is_ignored_in_matrix_subscript():
     out = translate_source("y <- x[2:n, , drop = FALSE]\n")
-    assert "y = r_subset(x, r_sub(r_seq(2, n), 1), slice(None))" in out
+    assert "y = r_subset(x, r_seq(2, n) - 1, slice(None))" in out
     assert "drop" not in out
 
 
 def test_negative_matrix_subscript_drops_axis_element():
     out = translate_source("a <- t(coef_mat[-1, , drop = FALSE])\n")
-    assert "a = (np.delete(coef_mat, r_sub(1, 1), axis=0)).T" in out
+    assert "a = np.delete(coef_mat, 1 - 1, axis=0).T" in out
     assert "drop" not in out
 
 
@@ -406,7 +615,7 @@ def test_default_argument_expression_can_reference_prior_arguments():
 
 def test_c_concatenates_existing_vector_arguments():
     out = translate_source("par <- c(par, as.numeric(t(a[[i]])))\n")
-    assert "par = r_c(par, np.asarray((r_matrix_index_get(a, r_sub(i, 1))).T, dtype=float))" in out
+    assert "par = r_c(par, np.asarray((r_list_get(a, i)).T, dtype=float))" in out
 
 
 def test_try_error_translation_for_cholesky():
@@ -427,9 +636,16 @@ def test_unnamed_list_and_double_bracket_indexing():
         "ys[[1]] <- xs[[2]]\n"
     )
     assert "xs = [r_c(1, 2), r_c(3, 4)]" in out
-    assert "r_s3_print(r_matrix_index_get(xs, 1))" in out
+    assert "r_s3_print(r_list_get(xs, 2))" in out
     assert "ys = ([None] * (2))" in out
-    assert "ys[(1) - 1] = r_matrix_index_get(xs, 1)" in out
+    assert "ys[(1) - 1] = r_list_get(xs, 2)" in out
+
+
+def test_variable_double_bracket_index_uses_one_based_list_get():
+    out = translate_source("print(mu[[k]])\n")
+    assert "def r_list_get(x, idx):" in out
+    assert "isinstance(x, RNamedVector)" in out
+    assert "r_s3_print(r_list_get(mu, k))" in out
 
 
 def test_common_matrix_vector_recycling_patterns():
@@ -441,6 +657,26 @@ def test_common_matrix_vector_recycling_patterns():
     assert "r_sub(log_dens, row_max[:, None])" in out
     assert "r_div(dens_shifted, np.sum(dens_shifted, axis=1)[:, None])" in out
     assert "r_mul(resp, x[:, None])" in out
+
+
+def test_mixture_weight_vector_recycling_patterns():
+    out = translate_source(
+        "mu[[k]] <- as.numeric(colSums(x * wk) / nk[k])\n"
+        "resp <- resp / row_sum\n"
+    )
+    assert "np.asarray(wk).reshape(-1, 1)" in out
+    assert "np.asarray(row_sum).reshape(-1, 1)" in out
+
+
+def test_storage_mode_double_assignment_translates_to_float_array():
+    out = translate_source('storage.mode(x) <- "double"\n')
+    assert "x = np.asarray(x, dtype=float)" in out
+
+
+def test_read_table_default_separator_uses_normal_string_literal():
+    out = translate_source("x <- read.table(in_file, header = FALSE)\n")
+    assert "sep='\\\\s+'" in out
+    assert "r__R_STR" not in out
 
 
 def test_row_and_column_means_translate():
