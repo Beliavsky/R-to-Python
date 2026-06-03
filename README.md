@@ -18,6 +18,8 @@ The transpiler works best on small, self-contained `.r` scripts using base R and
 straightforward numerical code. Package-heavy code, advanced non-standard
 evaluation, and complex R object systems may require additional translator work.
 
+For a quick feel for the generated code, see [small translation examples](docs/examples.md).
+
 ## Quick start
 
 Translate an R file:
