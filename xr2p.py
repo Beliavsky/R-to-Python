@@ -927,6 +927,15 @@ def r_paste(*values, sep=" ", collapse=None):
     return out
 """.strip()
         )
+    if "r_list_get(" in python:
+        helpers.append(
+            """
+def r_list_get(x, idx):
+    if isinstance(idx, str):
+        return getattr(x, idx) if hasattr(x, idx) else x[idx]
+    return x[int(idx) - 1]
+""".strip()
+        )
     if "r_substr(" in python:
         helpers.append(
             """
@@ -1179,8 +1188,8 @@ def ecdf_py(x):
     if "r_as_date(" in python or "r_date_add(" in python or "r_date_format(" in python or "r_date_seq(" in python or "r_diff(" in python:
         helpers.append(
             """
-def r_as_date(x):
-    return pd.to_datetime(np.asarray(x), format="%Y-%m-%d")
+def r_as_date(x, format="%Y-%m-%d"):
+    return pd.to_datetime(np.asarray(x), format=format)
 
 
 def r_date_add(x, days):
@@ -1449,8 +1458,12 @@ def r_within(df, updates):
     if "r_order(" in python or "r_rank(" in python:
         helpers.append(
             """
-def r_order(x):
-    return np.argsort(np.asarray(x), kind="stable") + 1
+def r_order(x, decreasing=False):
+    values = np.asarray(x)
+    order = np.argsort(values, kind="stable")
+    if decreasing:
+        order = order[::-1]
+    return order + 1
 
 
 def r_rank(x):
@@ -1637,7 +1650,7 @@ def r_model_matrix(data, response, terms):
     return out
 """.strip()
         )
-    if "r_c(" in python or "r_names(" in python or "RList(" in python or "RNamedVector(" in python or "r_attributes(" in python or "r_list_from_dots(" in python or "do_call_py(" in python or "rle_py(" in python or "inverse_rle_py(" in python or "summary_py(" in python or "r_table(" in python or "r_tapply(" in python or "r_lapply(" in python or "r_sapply(" in python or "r_split(" in python or "r_unsplit(" in python or "eigen_py(" in python or "svd_py(" in python or "qr_py(" in python or "prcomp_py(" in python:
+    if "r_c(" in python or "r_names(" in python or "r_setdiff(" in python or "RList(" in python or "RNamedVector(" in python or "r_attributes(" in python or "r_list_from_dots(" in python or "do_call_py(" in python or "rle_py(" in python or "inverse_rle_py(" in python or "summary_py(" in python or "r_table(" in python or "r_tapply(" in python or "r_lapply(" in python or "r_sapply(" in python or "r_split(" in python or "r_unsplit(" in python or "eigen_py(" in python or "svd_py(" in python or "qr_py(" in python or "prcomp_py(" in python:
         helpers.append(
             """
 class RList(SimpleNamespace):
@@ -1773,6 +1786,12 @@ def r_names(x):
     if isinstance(x, SimpleNamespace):
         return np.array(getattr(x, "_r_names", [name for name in vars(x) if not name.startswith("_")]))
     return None
+
+
+def r_setdiff(x, y):
+    left = np.ravel(np.asarray(x, dtype=object))
+    right = set(np.ravel(np.asarray(y, dtype=object)).tolist())
+    return np.array([item for item in left if item not in right], dtype=object)
 
 
 def r_list_from_dots(args, kwargs):
@@ -2548,7 +2567,7 @@ def translate_statement(line: str) -> list[str]:
             f"if 'pd' in globals() and isinstance({py_obj}, pd.DataFrame):",
             INDENT + f"{py_obj}[{py_field!r}] = {py_rhs}",
             "else:",
-            INDENT + f"{py_obj}.{py_field} = {py_rhs}",
+            INDENT + f"setattr({py_obj}, {py_field!r}, {py_rhs})",
             INDENT + f"if hasattr({py_obj}, '_r_names') and {py_field!r} not in {py_obj}._r_names:",
             INDENT * 2 + f"{py_obj}._r_names.append({py_field!r})",
         ]
@@ -2682,7 +2701,7 @@ def is_metadata_assignment(line: str) -> bool:
         pos = find_top_level_operator(line, op)
         if pos >= 0:
             lhs = line[:pos].strip().lower()
-            return lhs.startswith(("colnames(", "rownames(", "dimnames(", "names("))
+            return lhs.startswith(("colnames(", "rownames(", "dimnames(", "names(", "storage.mode("))
     return False
 
 
@@ -2691,10 +2710,18 @@ def translate_metadata_assignment(line: str) -> list[str] | None:
     if assign is None:
         return None
     lhs, rhs = assign
-    m = re.match(r"(colnames|rownames|row\.names|row_names|names)\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", lhs, re.IGNORECASE)
+    m = re.match(r"(colnames|rownames|row\.names|row_names|names|storage\.mode)\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", lhs, re.IGNORECASE)
     if not m:
         return None
     kind, obj = m.groups()
+    if kind.lower() == "storage.mode":
+        py_obj = r_name(obj)
+        mode = rhs.strip().strip("\"'")
+        if mode in {"double", "numeric"}:
+            return [f"{py_obj} = np.asarray({py_obj}, dtype=float)"]
+        if mode in {"integer"}:
+            return [f"{py_obj} = np.asarray({py_obj}, dtype=int)"]
+        return ["pass  # R storage.mode assignment omitted"]
     if kind.lower() == "names":
         py_obj = r_name(obj)
         if rhs.strip().upper() == "NULL":
@@ -3055,9 +3082,12 @@ def replace_matrix_vector_recycling(expr: str) -> str:
         expr,
     )
     expr = re.sub(r"\bdens\s*/\s*denom(?!\s*\[:,\s*None\])", "dens / denom[:, None]", expr)
+    expr = re.sub(r"\bresp\s*/\s*row_sum\b", "resp / np.asarray(row_sum).reshape(-1, 1)", expr)
     expr = re.sub(r"\bresp\s*\*\s*x(?!\s*\[:,\s*None\])", "resp * x[:, None]", expr)
-    expr = re.sub(r"\bxc\s*\*\s*w(?!\s*\[:,\s*None\])", "xc * w[:, None]", expr)
-    expr = re.sub(r"\bx\s*\*\s*w(?!\s*\[:,\s*None\])", "x * w[:, None]", expr)
+    expr = re.sub(r"\bxc\s*\*\s*w\b(?!\s*\[:,\s*None\])", "xc * np.asarray(w).reshape(-1, 1)", expr)
+    expr = re.sub(r"\bx\s*\*\s*w\b(?!\s*\[:,\s*None\])", "x * np.asarray(w).reshape(-1, 1)", expr)
+    expr = re.sub(r"\bxc\s*\*\s*wk\b(?!\s*\[:,\s*None\])", "xc * np.asarray(wk).reshape(-1, 1)", expr)
+    expr = re.sub(r"\bx\s*\*\s*wk\b(?!\s*\[:,\s*None\])", "x * np.asarray(wk).reshape(-1, 1)", expr)
     return expr
 
 
@@ -3115,7 +3145,7 @@ def replace_innermost_call(expr: str) -> str:
     pattern = re.compile(r"(?<![\w.])([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)\s*\(")
     for match in pattern.finditer(expr):
         name = match.group(1)
-        if name.startswith(("np.", "stats.", "pd.")) or name in {"SimpleNamespace", "RList", "RNamedVector", "RFactor", "RTimeSeries", "r_print", "r_s3_print", "r_s3_dispatch", "r_add", "r_sub", "r_mul", "r_div", "r_seq", "r_range", "r_subset", "r_set_subset", "r_subset_df", "r_with", "r_within", "r_col_key", "r_row_key", "r_attr", "r_set_attr", "r_attributes", "r_eval", "r_parse", "r_paste", "r_substr", "r_factor", "r_levels", "r_factor_int", "r_table", "r_tapply", "cut_py", "r_lapply", "r_sapply", "r_mapply", "outer_py", "r_split", "r_unsplit", "r_as_date", "r_date_add", "r_date_format", "r_date_seq", "r_diff", "r_ts", "r_start", "r_end", "r_frequency", "r_window", "r_lag", "arima_py", "arima_sim_py", "kmeans_py", "stack_py", "unstack_py", "prcomp_py", "aov_py", "glm_py", "r_list_from_dots", "do_call_py", "capture_output_py", "rle_py", "inverse_rle_py", "r_df_col", "r_data_frame", "r_model_matrix", "r_matrix_data", "cbind_py", "rbind_py", "acf_py", "uniroot_py", "integrate_py", "try_catch_py", "eigen_py", "svd_py", "qr_py", "summary_py", "ecdf_py", "getattr", "globals", "int", "float", "str", "len"}:
+        if name.startswith(("np.", "stats.", "pd.")) or name in {"SimpleNamespace", "RList", "RNamedVector", "RFactor", "RTimeSeries", "r_print", "r_s3_print", "r_s3_dispatch", "r_add", "r_sub", "r_mul", "r_div", "r_seq", "r_range", "r_subset", "r_set_subset", "r_subset_df", "r_with", "r_within", "r_col_key", "r_row_key", "r_attr", "r_set_attr", "r_attributes", "r_eval", "r_parse", "r_paste", "r_substr", "r_list_get", "r_factor", "r_levels", "r_factor_int", "r_table", "r_tapply", "cut_py", "r_lapply", "r_sapply", "r_mapply", "outer_py", "r_split", "r_unsplit", "r_as_date", "r_date_add", "r_date_format", "r_date_seq", "r_diff", "r_ts", "r_start", "r_end", "r_frequency", "r_window", "r_lag", "arima_py", "arima_sim_py", "kmeans_py", "stack_py", "unstack_py", "prcomp_py", "aov_py", "glm_py", "r_list_from_dots", "do_call_py", "capture_output_py", "rle_py", "inverse_rle_py", "r_df_col", "r_data_frame", "r_model_matrix", "r_matrix_data", "cbind_py", "rbind_py", "acf_py", "uniroot_py", "integrate_py", "try_catch_py", "eigen_py", "svd_py", "qr_py", "summary_py", "ecdf_py", "getattr", "globals", "int", "float", "str", "len"}:
             continue
         open_pos = expr.find("(", match.start())
         close_pos = find_matching_paren(expr, open_pos)
@@ -3170,7 +3200,7 @@ def replace_double_subscript(match: re.Match[str]) -> str:
         return f"{base}.__R_ATTR_{placeholder.group(1)}__"
     if re.fullmatch(r"\d+", index):
         return f"{base}[{int(index) - 1}]"
-    return f"{base}[{translate_subscript(index)}]"
+    return f"r_list_get({base}, {translate_expr(index)})"
 
 
 def replace_single_subscript(match: re.Match[str]) -> str:
@@ -3186,7 +3216,7 @@ def replace_single_subscript(match: re.Match[str]) -> str:
         item = index.replace(" ", "")[1:]
         return f"np.delete({base}, ({item}) - 1)"
     if ("." in base or "@@MEM@@" in base) and re.match(r"^[A-Za-z_]\w*$", index):
-        return f"r_subset({translate_member_expr(base)}, {translate_expr(index)})"
+        return f"r_matrix_index_get({translate_member_expr(base)}, {translate_expr(index)})"
     return f"r_matrix_index_get({base}, {translate_expr(index)})"
 
 
@@ -3346,7 +3376,11 @@ def is_string_index_expr(text: str) -> bool:
     if re.fullmatch(r"__R_STR_\d+__", text):
         return True
     raw_call = parse_full_call(text)
-    if raw_call is None or raw_call[0].lower() != "c":
+    if raw_call is None:
+        return False
+    if raw_call[0].lower() == "setdiff":
+        return True
+    if raw_call[0].lower() != "c":
         return False
     return all(re.fullmatch(r"__R_STR_\d+__", arg.strip()) or is_string_literal(arg.strip()) for arg in raw_call[1])
 
@@ -3714,7 +3748,8 @@ def translate_call(name: str, args: list[str]) -> str:
         sorted_expr = f"np.sort({py_args[0]})"
         return f"({sorted_expr}[::-1] if {decreasing} else {sorted_expr})"
     if lname == "order":
-        return "r_order(" + py_args[0] + ")"
+        decreasing = translate_expr(keyword_arg(args, "decreasing", default="False"))
+        return f"r_order({py_args[0]}, decreasing={decreasing})"
     if lname == "rank":
         return "r_rank(" + py_args[0] + ")"
     if lname == "var":
@@ -3739,8 +3774,12 @@ def translate_call(name: str, args: list[str]) -> str:
         return "np.maximum(" + ", ".join(py_args) + ")"
     if lname == "pmin":
         return "np.minimum(" + ", ".join(py_args) + ")"
+    if lname == "setdiff":
+        return "r_setdiff(" + ", ".join(py_args) + ")"
     if lname == "as.numeric":
         return "np.asarray(" + py_args[0] + ", dtype=float)"
+    if lname == "as.character":
+        return "np.asarray(" + py_args[0] + ", dtype=str)"
     if lname == "as.vector":
         return "np.ravel(" + py_args[0] + ", order='F')"
     if lname == "as.matrix":
@@ -3752,7 +3791,9 @@ def translate_call(name: str, args: list[str]) -> str:
     if lname == "attributes":
         return "r_attributes(" + py_args[0] + ")"
     if lname == "as.date":
-        return "r_as_date(" + py_args[0] + ")"
+        fmt = keyword_arg(args, "format")
+        fmt_arg = "" if fmt is None else ", format=" + translate_expr(fmt)
+        return "r_as_date(" + py_args[0] + fmt_arg + ")"
     if lname == "as.integer":
         return "(r_factor_int(" + py_args[0] + ") if 'RFactor' in globals() and isinstance(" + py_args[0] + ", RFactor) else np.asarray(" + py_args[0] + ", dtype=int))"
     if lname == "chartoraw":
@@ -4343,7 +4384,7 @@ def translate_read_table_call(args: list[str]) -> str:
     file_arg = translate_expr(args[0])
     header = translate_expr(keyword_arg(args, "header", default="False"))
     sep = keyword_arg(args, "sep")
-    sep_arg = "r'\\s+'" if sep is None or string_literal_value(sep.strip()) == "" else translate_expr(sep)
+    sep_arg = "'\\\\s+'" if sep is None or string_literal_value(sep.strip()) == "" else translate_expr(sep)
     header_arg = "0" if header == "True" else "None"
     return f"pd.read_csv({file_arg}, sep={sep_arg}, header={header_arg})"
 
@@ -4990,11 +5031,46 @@ def apply_recycled_binops(expr: str) -> str:
 
     op_map = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul", ast.Div: "div"}
 
+    def is_safe_plain_operand(node: ast.AST) -> bool:
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, (int, float, complex, bool))
+        if isinstance(node, ast.Name):
+            return len(node.id) > 1 or node.id in {"x", "y"}
+        if isinstance(node, ast.Attribute):
+            return True
+        if isinstance(node, ast.Call):
+            return True
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+            return is_safe_plain_operand(node.left) and is_safe_plain_operand(node.right)
+        return False
+
+    def should_keep_python_operator(node: ast.BinOp) -> bool:
+        if isinstance(node.op, ast.Add):
+            return (
+                isinstance(node.left, ast.BinOp)
+                and isinstance(node.left.op, ast.Pow)
+                and isinstance(node.right, ast.BinOp)
+                and isinstance(node.right.op, ast.Pow)
+            )
+        if isinstance(node.op, ast.Sub):
+            return is_safe_plain_operand(node.left) and is_safe_plain_operand(node.right)
+        if isinstance(node.op, ast.Mult):
+            return (
+                isinstance(node.left, ast.Constant)
+                and is_safe_plain_operand(node.right)
+            ) or (
+                isinstance(node.right, ast.Constant)
+                and is_safe_plain_operand(node.left)
+            )
+        return False
+
     class Rewriter(ast.NodeTransformer):
         def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
             node = self.generic_visit(node)
             op_name = op_map.get(type(node.op))
             if op_name is None:
+                return node
+            if should_keep_python_operator(node):
                 return node
             return ast.copy_location(
                 ast.Call(
@@ -5158,6 +5234,8 @@ def round_numeric_tokens(text: str, digits: int | None) -> str:
         low = token.lower()
         if low in {"nan", "+nan", "-nan", "inf", "+inf", "-inf"}:
             return token
+        if re.fullmatch(r"[+-]?\d+", token):
+            return token
         try:
             value = float(token.replace("D", "E").replace("d", "E"))
         except Exception:
@@ -5169,7 +5247,15 @@ def round_numeric_tokens(text: str, digits: int | None) -> str:
     return number_re.sub(repl, text)
 
 
-def normalize_output(text: str, digits: int | None = None) -> list[str]:
+def flush_left_output(text: str) -> str:
+    return "\n".join(line.lstrip() for line in text.splitlines()) + ("\n" if text.endswith("\n") else "")
+
+
+def squeeze_output_spaces(text: str) -> str:
+    return "\n".join(re.sub(r" {2,}", " ", line) for line in text.splitlines()) + ("\n" if text.endswith("\n") else "")
+
+
+def normalize_output(text: str, digits: int | None = None, *, flush_left: bool = False, squeeze: bool = False) -> list[str]:
     if not text:
         return []
     out: list[str] = []
@@ -5177,6 +5263,10 @@ def normalize_output(text: str, digits: int | None = None) -> list[str]:
     for line in text.splitlines():
         line = index_re.sub("", line.rstrip("\n"))
         line = round_numeric_tokens(line, digits)
+        if flush_left:
+            line = line.lstrip()
+        if squeeze:
+            line = re.sub(r" {2,}", " ", line)
         line = normalize_output_spacing(line)
         line = normalize_quoted_string_tokens(line)
         out.append(line)
@@ -5193,9 +5283,9 @@ def normalize_quoted_string_tokens(line: str) -> str:
         return " ".join(part[1:-1] if is_string_literal(part) else part for part in parts)
     return line
 
-def outputs_match(a: str, b: str, *, digits: int | None = None) -> tuple[bool, str]:
-    a_lines = normalize_output(a, digits)
-    b_lines = normalize_output(b, digits)
+def outputs_match(a: str, b: str, *, digits: int | None = None, flush_left: bool = False, squeeze: bool = False) -> tuple[bool, str]:
+    a_lines = normalize_output(a, digits, flush_left=flush_left, squeeze=squeeze)
+    b_lines = normalize_output(b, digits, flush_left=flush_left, squeeze=squeeze)
     if a_lines == b_lines:
         return True, ""
 
@@ -5261,17 +5351,27 @@ def print_process_output(result: subprocess.CompletedProcess[str]) -> None:
         print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr)
 
 
-def print_result_output(result: subprocess.CompletedProcess[str], digits: int | None, *, pretty_r: bool = False) -> None:
+def print_result_output(result: subprocess.CompletedProcess[str], digits: int | None, *, pretty_r: bool = False, flush_left: bool = False, squeeze: bool = False) -> None:
     if result.stdout:
         stdout = pretty_r_output(result.stdout) if pretty_r else result.stdout
+        stdout = round_numeric_tokens(stdout, digits)
+        if flush_left:
+            stdout = flush_left_output(stdout)
+        if squeeze:
+            stdout = squeeze_output_spaces(stdout)
         print(
-            round_numeric_tokens(stdout, digits),
+            stdout,
             end="" if result.stdout.endswith("\n") else "\n",
         )
     if result.stderr:
         stderr = pretty_r_output(result.stderr) if pretty_r else result.stderr
+        stderr = round_numeric_tokens(stderr, digits)
+        if flush_left:
+            stderr = flush_left_output(stderr)
+        if squeeze:
+            stderr = squeeze_output_spaces(stderr)
         print(
-            round_numeric_tokens(stderr, digits),
+            stderr,
             end="" if result.stderr.endswith("\n") else "\n",
             file=sys.stderr,
         )
@@ -5362,6 +5462,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="make displayed R output look more like Python output",
     )
+    parser.add_argument(
+        "--flush-left",
+        action="store_true",
+        help="strip leading whitespace from each displayed output line",
+    )
+    parser.add_argument(
+        "--squeeze",
+        action="store_true",
+        help="replace runs of two or more spaces in displayed output with one space",
+    )
     parser.add_argument("--rscript", default="rscript", help="command used to run R scripts")
     args = parser.parse_args(argv)
 
@@ -5421,17 +5531,19 @@ def main(argv: list[str] | None = None) -> int:
         print("Run (R):", args.rscript, args.source)
         r_result = run_r(args.source, args.rscript)
         print("Run (R):", "PASS" if r_result.returncode == 0 else f"FAIL exit={r_result.returncode}")
-        print_result_output(r_result, r_round_digits, pretty_r=args.pretty)
+        print_result_output(r_result, r_round_digits, pretty_r=args.pretty, flush_left=args.flush_left, squeeze=args.squeeze)
         print("Run (Python):", sys.executable, out)
         py_result = run_python(out)
         print("Run (Python):", "PASS" if py_result.returncode == 0 else f"FAIL exit={py_result.returncode}")
-        print_result_output(py_result, python_round_digits)
+        print_result_output(py_result, python_round_digits, flush_left=args.flush_left, squeeze=args.squeeze)
         if args.run_diff:
             compare_digits = args.round_both if args.round_both is not None else args.round
             same, diff = outputs_match(
                 r_result.stdout,
                 py_result.stdout,
                 digits=compare_digits,
+                flush_left=args.flush_left,
+                squeeze=args.squeeze,
             )
             if not same:
                 print("Run (diff):", "FAIL")
@@ -5452,7 +5564,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if r_result.returncode == 0 and py_result.returncode == 0 else 1
     if args.run:
         result = run_python(out)
-        print_result_output(result, python_round_digits)
+        print_result_output(result, python_round_digits, flush_left=args.flush_left, squeeze=args.squeeze)
         return result.returncode
     return 0
 
