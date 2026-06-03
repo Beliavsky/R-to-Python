@@ -24,6 +24,7 @@ from pathlib import Path
 
 INDENT = "    "
 USER_FUNCTION_PARAMS: dict[str, list[str]] = {}
+USER_FUNCTION_NAMES: set[str] = set()
 PENDING_FUNCTION_PARAMS: list[str] | None = None
 NAMED_VECTOR_VARS: set[str] = set()
 DOTTED_R_VARS: set[str] = set()
@@ -43,6 +44,7 @@ class R2PyError(Exception):
 
 def translate_source(source: str, *, use_numba: bool = True) -> str:
     USER_FUNCTION_PARAMS.clear()
+    USER_FUNCTION_NAMES.clear()
     NAMED_VECTOR_VARS.clear()
     DOTTED_R_VARS.clear()
     CHARACTER_VECTOR_VARS.clear()
@@ -253,7 +255,7 @@ def r_line_continues(line: str) -> bool:
         return True
     if stripped.endswith("=") and len(stripped) >= 2 and stripped[-2] not in {"=", "!", "<", ">"}:
         return True
-    return bool(re.search(r"(\+|-|\*|/|\||&|,)\s*$", stripped))
+    return bool(re.search(r"(%[^%\s]+%|\+|-|\*|/|\||&|,)\s*$", stripped))
 
 
 def has_unbalanced_delimiters(text: str) -> bool:
@@ -1430,7 +1432,22 @@ def r_set_subset(x, value, *keys):
         else:
             x.iloc[row_key, col_key] = value
         return x
-    key = keys[0] if len(keys) == 1 else keys
+    if len(keys) > 1:
+        if len(keys) == 2:
+            row_key, col_key = keys
+            row_arr = np.asarray(row_key) if not isinstance(row_key, slice) else None
+            col_arr = np.asarray(col_key) if not isinstance(col_key, slice) else None
+            if (
+                row_arr is not None
+                and col_arr is not None
+                and row_arr.dtype.kind in {"i", "u"}
+                and col_arr.dtype.kind in {"i", "u"}
+            ):
+                x[np.ix_(row_arr, col_arr)] = value
+                return x
+        x[keys] = value
+        return x
+    key = keys[0]
     if isinstance(key, (list, tuple, np.ndarray)):
         arr = np.asarray(key)
         if arr.dtype == bool:
@@ -1669,7 +1686,7 @@ def r_model_matrix(data, response, terms):
     return out
 """.strip()
         )
-    if "r_c(" in python or "r_names(" in python or "r_setdiff(" in python or "RList(" in python or "RNamedVector(" in python or "r_attributes(" in python or "r_list_from_dots(" in python or "do_call_py(" in python or "rle_py(" in python or "inverse_rle_py(" in python or "summary_py(" in python or "r_table(" in python or "r_tapply(" in python or "r_lapply(" in python or "r_sapply(" in python or "r_split(" in python or "r_unsplit(" in python or "eigen_py(" in python or "svd_py(" in python or "qr_py(" in python or "prcomp_py(" in python:
+    if "r_c(" in python or "r_names(" in python or "r_setdiff(" in python or "RList(" in python or "RNamedVector(" in python or "r_attributes(" in python or "r_list_from_dots(" in python or "do_call_py(" in python or "rle_py(" in python or "inverse_rle_py(" in python or "summary_py(" in python or "r_table(" in python or "r_tapply(" in python or "r_lapply(" in python or "r_sapply(" in python or "r_split(" in python or "r_unsplit(" in python or "eigen_py(" in python or "svd_py(" in python or "qr_py(" in python or "determinant_py(" in python or "prcomp_py(" in python:
         helpers.append(
             """
 class RList(SimpleNamespace):
@@ -2115,6 +2132,15 @@ def var_r(x):
     return np.cov(x, rowvar=False, ddof=1)
 """.strip()
         )
+    if "determinant_py(" in python:
+        helpers.append(
+            """
+def determinant_py(x, logarithm=True):
+    sign, logabsdet = np.linalg.slogdet(np.asarray(x, dtype=float))
+    modulus = logabsdet if logarithm else sign * np.exp(logabsdet)
+    return RList(modulus=np.array([modulus]), sign=sign, _r_names=["modulus", "sign"])
+""".strip()
+        )
     if "cor_py(" in python:
         helpers.append(
             """
@@ -2130,6 +2156,18 @@ def cor_py(x, y=None, use=None):
     y = np.asarray(y, dtype=float)
     mask = np.isfinite(x) & np.isfinite(y) if use in {"pairwise.complete.obs", "complete.obs"} else slice(None)
     return np.corrcoef(x[mask], y[mask])[0, 1]
+""".strip()
+        )
+    if "complete_cases_py(" in python:
+        helpers.append(
+            """
+def complete_cases_py(x):
+    if isinstance(x, pd.DataFrame):
+        return np.asarray(x.notna().all(axis=1))
+    arr = np.asarray(x)
+    if arr.ndim <= 1:
+        return ~pd.isna(arr)
+    return np.all(~pd.isna(arr), axis=1)
 """.strip()
         )
     if "lm_py(" in python or "glm_py(" in python or "aov_py(" in python or "summary_py(" in python:
@@ -2550,29 +2588,35 @@ def translate_statement(line: str) -> list[str]:
     parsed_func = parse_function_definition(line)
     if parsed_func is not None:
         name, args, body = parsed_func
+        py_name = r_function_name(name)
+        USER_FUNCTION_NAMES.add(py_name)
         params = function_param_names(args)
-        USER_FUNCTION_PARAMS[r_function_name(name)] = params
+        USER_FUNCTION_PARAMS[py_name] = params
         PENDING_FUNCTION_PARAMS = params
         signature, setup = translate_function_signature(args)
         if body is not None:
-            return [f"def {r_function_name(name)}({signature}):", *[INDENT + line for line in setup], INDENT + "return " + translate_expr(body)]
-        return [f"def {r_function_name(name)}({signature}):", *[INDENT + line for line in setup]]
+            return [f"def {py_name}({signature}):", *[INDENT + line for line in setup], INDENT + "return " + translate_expr(body)]
+        return [f"def {py_name}({signature}):", *[INDENT + line for line in setup]]
     expr_func_match = re.match(r"([A-Za-z]\w*(?:\.\w+)*)\s*(?:<-|=)\s*function\s*\((.*?)\)\s+(.+)$", line)
     if expr_func_match:
         name, args, body = expr_func_match.groups()
         params = function_param_names(args)
         USER_FUNCTION_PARAMS[r_function_name(name)] = params
         PENDING_FUNCTION_PARAMS = params
+        py_name = r_function_name(name)
+        USER_FUNCTION_NAMES.add(py_name)
         signature, setup = translate_function_signature(args)
-        return [f"def {r_function_name(name)}({signature}):", *[INDENT + line for line in setup], INDENT + "return " + translate_expr(body)]
+        return [f"def {py_name}({signature}):", *[INDENT + line for line in setup], INDENT + "return " + translate_expr(body)]
     func_match = re.match(r"([A-Za-z]\w*(?:\.\w+)*)\s*(?:<-|=)\s*function\s*\((.*)\)\s*$", line)
     if func_match:
         name, args = func_match.groups()
+        py_name = r_function_name(name)
+        USER_FUNCTION_NAMES.add(py_name)
         params = function_param_names(args)
-        USER_FUNCTION_PARAMS[r_function_name(name)] = params
+        USER_FUNCTION_PARAMS[py_name] = params
         PENDING_FUNCTION_PARAMS = params
         signature, setup = translate_function_signature(args)
-        return [f"def {r_function_name(name)}({signature}):", *[INDENT + line for line in setup]]
+        return [f"def {py_name}({signature}):", *[INDENT + line for line in setup]]
 
     use_method_call = parse_full_call(line)
     if use_method_call is not None and use_method_call[0].lower() == "usemethod":
@@ -3065,6 +3109,7 @@ def split_assignment(line: str) -> tuple[str, str] | None:
                     CHARACTER_VECTOR_VARS.add(py_lhs)
                 else:
                     CHARACTER_VECTOR_VARS.discard(py_lhs)
+                return py_lhs, rhs
             return translate_expr(lhs), rhs
     return None
 
@@ -3079,6 +3124,9 @@ def raw_assignment(line: str) -> tuple[str, str] | None:
 
 def translate_expr(expr: str) -> str:
     expr = expr.strip().rstrip(";")
+    det_mod = translate_determinant_modulus_expr(expr)
+    if det_mod is not None:
+        return det_mod
     raw_call = parse_full_call(expr)
     if raw_call is not None and raw_call[0].lower() == "vector":
         return translate_vector_call(raw_call[1])
@@ -3088,6 +3136,22 @@ def translate_expr(expr: str) -> str:
     for i, text in enumerate(strings):
         expr = expr.replace(f"__R_ATTR_{i}__", r_name(text[1:-1]))
     return expr
+
+
+def translate_determinant_modulus_expr(expr: str) -> str | None:
+    match = re.match(r"^determinant\s*\(", expr, re.IGNORECASE)
+    if not match:
+        return None
+    open_pos = expr.find("(", match.start())
+    close_pos = find_matching_char(expr, open_pos, "(", ")")
+    if close_pos < 0:
+        return None
+    tail = expr[close_pos + 1 :].strip()
+    idx_match = re.match(r"^\$\s*modulus\s*\[\s*(.+?)\s*\]\s*$", tail, re.IGNORECASE)
+    if not idx_match:
+        return None
+    args = split_args(expr[open_pos + 1 : close_pos])
+    return f"r_matrix_index_get({translate_call('determinant', args)}.modulus, {translate_expr(idx_match.group(1))})"
 
 
 def translate_expr_code(expr: str) -> str:
@@ -3192,6 +3256,10 @@ def replace_complex_literals(expr: str) -> str:
 
 
 def replace_ranges(expr: str) -> str:
+    range_parts = split_top_level_range(expr)
+    if range_parts is not None:
+        start, stop = range_parts
+        return f"r_seq({start}, {stop})"
     name_atom = r"[A-Za-z_]\w*(?:(?:@@MEM@@|\.)[A-Za-z_]\w*)*"
     atom = rf"(?:{name_atom}\([^()]*\)|\([^()]+\)|{name_atom}(?!\s*\()|\d+(?:\.\d+)?)"
     pattern = re.compile(rf"(?<![\w.=])({atom})\s*:\s*({atom})(?![\w.])")
@@ -3336,7 +3404,7 @@ def replace_double_subscript(match: re.Match[str]) -> str:
     if placeholder:
         return f"{base}.__R_ATTR_{placeholder.group(1)}__"
     if re.fullmatch(r"\d+", index):
-        return f"{base}[{int(index) - 1}]"
+        return f"r_list_get({base}, {index})"
     return f"r_list_get({base}, {translate_expr(index)})"
 
 
@@ -3440,6 +3508,8 @@ def split_top_level_range(text: str) -> tuple[str, str] | None:
         elif ch == ":" and depth == 0:
             if not text[:i].strip() or not text[i + 1 :].strip():
                 return None
+            if re.search(r"\blambda_?\s*$", text[:i]):
+                continue
             return text[:i].strip(), text[i + 1 :].strip()
     return None
 
@@ -3605,7 +3675,7 @@ def is_logical_subscript(index: str) -> bool:
     if index.startswith(("np.is", "is.", "is_", "~")):
         return True
     raw_call = parse_full_call(index)
-    if raw_call is not None and raw_call[0].lower() in {"grepl", "is.na", "is.nan", "is.finite", "is.infinite", "lower.tri", "upper.tri"}:
+    if raw_call is not None and raw_call[0].lower() in {"grepl", "is.na", "is.nan", "is.finite", "is.infinite", "complete.cases", "complete_cases_py", "lower.tri", "upper.tri"}:
         return True
     if index.startswith(","):
         return False
@@ -3897,6 +3967,9 @@ def translate_call(name: str, args: list[str]) -> str:
         return "svd_py(" + py_args[0] + ")"
     if lname == "qr":
         return "qr_py(" + py_args[0] + ")"
+    if lname == "determinant":
+        logarithm = translate_expr(keyword_arg(args, "logarithm", default="True"))
+        return "determinant_py(" + py_args[0] + ", logarithm=" + logarithm + ")"
     if lname in {"sum", "mean", "median", "prod"}:
         na_rm = keyword_arg(args, "na.rm", default="False")
         if translate_expr(na_rm) == "True":
@@ -3974,6 +4047,8 @@ def translate_call(name: str, args: list[str]) -> str:
         return "np.isnan(" + py_args[0] + ")"
     if lname == "is.na":
         return "pd.isna(" + py_args[0] + ")"
+    if lname == "complete.cases":
+        return "complete_cases_py(" + py_args[0] + ")"
     if lname == "is.null":
         return "(" + py_args[0] + " is None)"
     if lname == "stopifnot":
@@ -5269,6 +5344,8 @@ def r_name(name: str) -> str:
     if "." in name and name not in DOTTED_R_VARS:
         return name
     out = re.sub(r"\W+", "_", name.replace(".", "_")).strip("_")
+    if "." in name and out in USER_FUNCTION_NAMES:
+        out += "_var"
     if not out:
         out = "x"
     if keyword.iskeyword(out):
