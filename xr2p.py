@@ -2633,6 +2633,8 @@ def add_pass_to_empty_blocks(python: str) -> str:
     out: list[str] = []
     for i, line in enumerate(lines):
         out.append(line)
+        if line.lstrip().startswith("#"):
+            continue
         if not line.rstrip().endswith(":"):
             continue
         if line.lstrip().startswith("def "):
