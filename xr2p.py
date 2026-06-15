@@ -29,6 +29,7 @@ PENDING_FUNCTION_PARAMS: list[str] | None = None
 NAMED_VECTOR_VARS: set[str] = set()
 DOTTED_R_VARS: set[str] = set()
 CHARACTER_VECTOR_VARS: set[str] = set()
+LOGICAL_VECTOR_VARS: set[str] = set()
 
 
 @dataclass
@@ -48,6 +49,7 @@ def translate_source(source: str, *, use_numba: bool = True) -> str:
     NAMED_VECTOR_VARS.clear()
     DOTTED_R_VARS.clear()
     CHARACTER_VECTOR_VARS.clear()
+    LOGICAL_VECTOR_VARS.clear()
     global PENDING_FUNCTION_PARAMS
     PENDING_FUNCTION_PARAMS = None
     out = ["import numpy as np", ""]
@@ -84,7 +86,8 @@ def translate_source(source: str, *, use_numba: bool = True) -> str:
     python = add_pass_to_empty_blocks(python)
     python = repair_generated_syntax_cleanup(python)
     if "stats." in python or "aov_py(" in python:
-        python = python.replace("import numpy as np\n", "import numpy as np\nfrom scipy import stats\n", 1)
+        python = python.replace("import numpy as np\n", "import numpy as np\nfrom scipy import stats as r_stats\n", 1)
+        python = python.replace("stats.", "r_stats.")
     if "optimize." in python or "uniroot_py(" in python or re.search(r"(?<![\w.])fsolve(?![\w.])", python):
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom scipy import optimize\n", 1)
     if "integrate." in python or "integrate_py(" in python:
@@ -2411,10 +2414,11 @@ def optim(par, fn, method="BFGS", control=None, **kwargs):
     from scipy import optimize
 
     x0 = np.asarray(par, dtype=float)
+    fn_kwargs = {k: v for k, v in kwargs.items() if k != "hessian"}
     maxiter = getattr(control, "maxit", None) if control is not None else None
     options = {"maxiter": int(maxiter)} if maxiter is not None else None
     result = optimize.minimize(
-        lambda z: fn(z, **kwargs),
+        lambda z: fn(z, **fn_kwargs),
         x0,
         method=method,
         options=options,
@@ -3276,6 +3280,10 @@ def split_assignment(line: str) -> tuple[str, str] | None:
                     CHARACTER_VECTOR_VARS.add(py_lhs)
                 else:
                     CHARACTER_VECTOR_VARS.discard(py_lhs)
+                if is_logical_vector_expr(rhs):
+                    LOGICAL_VECTOR_VARS.add(py_lhs)
+                else:
+                    LOGICAL_VECTOR_VARS.discard(py_lhs)
                 return py_lhs, rhs
             return translate_expr(lhs), rhs
     return None
@@ -3331,8 +3339,7 @@ def translate_expr_code(expr: str) -> str:
     expr = expr.replace("%*%", "@")
     expr = expr.replace("&&", " and ")
     expr = expr.replace("||", " or ")
-    expr = re.sub(r"(?<=[\w.)])\s*\|\s*(?=[\w.(])", " or ", expr)
-    expr = re.sub(r"(?<=[\w.)])\s*&\s*(?=[\w.(])", " and ", expr)
+    expr = normalize_logical_operators(expr)
     expr = re.sub(r"!\s*(?!=)", "not ", expr)
     expr = replace_complex_literals(expr)
     expr = replace_power(expr)
@@ -3366,6 +3373,27 @@ def replace_in_operator(expr: str) -> str:
     left = expr[:pos].strip()
     right = expr[pos + 4 :].strip()
     return f"r_in({translate_expr(left)}, {translate_expr(right)})"
+
+
+def normalize_logical_operators(expr: str) -> str:
+    expr = expr.strip()
+    expr = strip_outer_parens(expr) if expr.startswith("(") and expr.endswith(")") else expr
+    if not expr:
+        return expr
+
+    pos = find_top_level_operator(expr, "|")
+    if pos >= 0:
+        left = normalize_logical_operators(expr[:pos])
+        right = normalize_logical_operators(expr[pos + 1 :])
+        return f"({left}) | ({right})"
+
+    pos = find_top_level_operator(expr, "&")
+    if pos >= 0:
+        left = normalize_logical_operators(expr[:pos])
+        right = normalize_logical_operators(expr[pos + 1 :])
+        return f"({left}) & ({right})"
+
+    return expr
 
 
 def strip_outer_parens(text: str) -> str:
@@ -3520,7 +3548,7 @@ def replace_innermost_call(expr: str) -> str:
     pattern = re.compile(r"(?<![\w.])([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)\s*\(")
     for match in pattern.finditer(expr):
         name = match.group(1)
-        if name.startswith(("np.", "stats.", "pd.")) or name in {"SimpleNamespace", "RList", "RNamedVector", "RFactor", "RTimeSeries", "r_print", "r_s3_print", "r_s3_dispatch", "r_add", "r_sub", "r_mul", "r_div", "r_seq", "r_range", "r_subset", "r_set_subset", "r_subset_df", "r_with", "r_within", "r_col_key", "r_row_key", "r_attr", "r_set_attr", "r_attributes", "r_eval", "r_parse", "r_paste", "r_substr", "r_list_get", "r_factor", "r_levels", "r_factor_int", "r_table", "r_tapply", "cut_py", "r_lapply", "r_sapply", "r_mapply", "outer_py", "r_split", "r_unsplit", "r_as_date", "r_date_add", "r_date_format", "r_date_seq", "r_diff", "r_ts", "r_start", "r_end", "r_frequency", "r_window", "r_lag", "arima_py", "arima_sim_py", "kmeans_py", "stack_py", "unstack_py", "prcomp_py", "aov_py", "glm_py", "r_list_from_dots", "do_call_py", "capture_output_py", "rle_py", "inverse_rle_py", "r_df_col", "r_data_frame", "r_model_matrix", "r_matrix_data", "cbind_py", "rbind_py", "acf_py", "uniroot_py", "integrate_py", "try_catch_py", "eigen_py", "svd_py", "qr_py", "summary_py", "ecdf_py", "getattr", "globals", "int", "float", "str", "len"}:
+        if name.startswith(("np.", "stats.", "r_stats.", "pd.")) or name in {"SimpleNamespace", "RList", "RNamedVector", "RFactor", "RTimeSeries", "r_print", "r_s3_print", "r_s3_dispatch", "r_add", "r_sub", "r_mul", "r_div", "r_seq", "r_range", "r_subset", "r_set_subset", "r_subset_df", "r_with", "r_within", "r_col_key", "r_row_key", "r_attr", "r_set_attr", "r_attributes", "r_eval", "r_parse", "r_paste", "r_substr", "r_list_get", "r_factor", "r_levels", "r_factor_int", "r_table", "r_tapply", "cut_py", "r_lapply", "r_sapply", "r_mapply", "outer_py", "r_split", "r_unsplit", "r_as_date", "r_date_add", "r_date_format", "r_date_seq", "r_diff", "r_ts", "r_start", "r_end", "r_frequency", "r_window", "r_lag", "arima_py", "arima_sim_py", "kmeans_py", "stack_py", "unstack_py", "prcomp_py", "aov_py", "glm_py", "r_list_from_dots", "do_call_py", "capture_output_py", "rle_py", "inverse_rle_py", "r_df_col", "r_data_frame", "r_model_matrix", "r_matrix_data", "cbind_py", "rbind_py", "acf_py", "uniroot_py", "integrate_py", "try_catch_py", "eigen_py", "svd_py", "qr_py", "summary_py", "ecdf_py", "getattr", "globals", "int", "float", "str", "len"}:
             continue
         open_pos = expr.find("(", match.start())
         close_pos = find_matching_paren(expr, open_pos)
@@ -3791,6 +3819,65 @@ def is_character_vector_expr(text: str) -> bool:
     return False
 
 
+def is_logical_scalar_expr(text: str) -> bool:
+    text = strip_outer_parens(text.strip())
+    if not text:
+        return False
+    upper = text.upper()
+    if upper in {"TRUE", "FALSE", "T", "F"}:
+        return True
+    if text.startswith("!"):
+        return True
+    if re.search(r"\b(and|or|not)\b", text):
+        return True
+    raw_call = parse_full_call(text)
+    if raw_call is None:
+        return False
+    name = raw_call[0].lower()
+    return name in {
+        "is.na",
+        "is.nan",
+        "is.finite",
+        "is.infinite",
+        "is.logical",
+        "as.logical",
+    }
+
+
+def is_logical_vector_expr(text: str) -> bool:
+    text = strip_outer_parens(text.strip())
+    if not text:
+        return False
+    if text.upper() in {"TRUE", "FALSE", "T", "F"}:
+        return True
+    if any(op in text for op in ("<", ">", "==", "!=", "<=", ">=")):
+        return True
+    if "&" in text or "|" in text:
+        return True
+    if text.startswith("!"):
+        return True
+    raw_call = parse_full_call(text)
+    if raw_call is not None:
+        name = raw_call[0].lower()
+        if name in {
+            "is.na",
+            "is.nan",
+            "is.finite",
+            "is.infinite",
+            "is.logical",
+            "as.logical",
+            "complete.cases",
+            "complete_cases_py",
+            "grepl",
+            "lower.tri",
+            "upper.tri",
+        }:
+            return True
+        if name == "c":
+            return all(is_logical_scalar_expr(arg.strip()) for arg in raw_call[1]) and bool(raw_call[1])
+    return False
+
+
 def is_subscript_option(item: str) -> bool:
     item = strip_outer_parens(item)
     pos = find_top_level_operator(item, "=")
@@ -3852,6 +3939,8 @@ def is_logical_subscript(index: str) -> bool:
         if close != len(index) - 1:
             break
         index = index[1:-1].strip()
+    if r_name(index) in LOGICAL_VECTOR_VARS:
+        return True
     if index.startswith(("np.is", "is.", "is_", "~")):
         return True
     raw_call = parse_full_call(index)
@@ -4189,6 +4278,11 @@ def translate_call(name: str, args: list[str]) -> str:
         return "np.maximum(" + ", ".join(py_args) + ")" if len(py_args) > 1 else f"np.max({py_args[0]})"
     if lname == "sd":
         return "np.std(" + py_args[0] + ", ddof=1)"
+    if lname == "any":
+        na_rm = keyword_arg(args, "na.rm", default="False")
+        if translate_expr(na_rm) == "True":
+            return f"np.any((~pd.isna({py_args[0]})) & np.asarray({py_args[0]}, dtype=bool))"
+        return "np.any(" + ", ".join(py_args) + ")"
     if lname == "all":
         return "np.all(" + ", ".join(py_args) + ")"
     if lname == "pmax":
@@ -5521,10 +5615,10 @@ def r_name(name: str) -> str:
         return name
     if len(name) >= 2 and name[0] == "`" and name[-1] == "`":
         name = name[1:-1]
-    constants = {"True", "False", "None", "np", "pd", "stats", "nan", "inf", "and", "or", "not", "is", "in", "if", "else", "for"}
+    constants = {"True", "False", "None", "np", "pd", "stats", "r_stats", "nan", "inf", "and", "or", "not", "is", "in", "if", "else", "for"}
     if "@@MEM@@" in name:
         return ".".join(r_name(part) for part in name.split("@@MEM@@"))
-    if name in constants or name.startswith(("np.", "stats.", "pd.", "time.")):
+    if name in constants or name.startswith(("np.", "stats.", "r_stats.", "pd.", "time.")):
         return name
     if name[0].isdigit():
         return name
@@ -5541,7 +5635,7 @@ def r_name(name: str) -> str:
 
 
 def r_function_name(name: str) -> str:
-    if name.startswith(("np.", "stats.", "pd.", "time.", "linalg.")):
+    if name.startswith(("np.", "stats.", "r_stats.", "pd.", "time.", "linalg.")):
         return name
     return r_name(name.replace(".", "_"))
 
