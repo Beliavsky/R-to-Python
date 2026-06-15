@@ -673,6 +673,15 @@ def r_matrix_data(x):
     return arr
 """.strip()
         )
+    if "r_as_matrix(" in python:
+        helpers.append(
+            """
+def r_as_matrix(x):
+    if "pd" in globals() and isinstance(x, pd.DataFrame):
+        return x
+    return np.asarray(x, dtype=float)
+""".strip()
+        )
     if "t_py(" in python:
         helpers.append(
             """
@@ -906,8 +915,101 @@ def r_format_ts(x, digits=None):
         helpers.append(
             """
 def r_apply(x, margin, func):
+    def _as_callable(function):
+        if callable(function):
+            return function
+        if isinstance(function, str):
+            f = globals().get(function)
+            if callable(f):
+                return f
+        return None
+
+    def _result_to_array(value):
+        if isinstance(value, RNamedVector):
+            arr = np.asarray(value.values)
+            if arr.ndim == 0:
+                return np.array([arr.item()]), list(value.names)
+            return arr, list(value.names)
+        arr = np.asarray(value)
+        if arr.ndim == 0:
+            return np.array([arr.item()]), []
+        return np.ravel(arr), []
+
+    def _apply_to_matrix(matrix, axis):
+        fun = _as_callable(func) if not func in {"sum", "mean", "median", "var", "sd", "min", "max"} else None
+        output = []
+        if fun is None:
+            return None
+        row_names = None
+        col_names = None
+        if "pd" in globals() and isinstance(matrix, pd.DataFrame):
+            col_names = list(matrix.columns)
+            row_names = list(matrix.index)
+            if axis == 0:
+                for i in range(matrix.shape[0]):
+                    values, names = _result_to_array(fun(matrix.iloc[i, :]))
+                    output.append((values, names))
+            else:
+                for j in range(matrix.shape[1]):
+                    values, names = _result_to_array(fun(matrix.iloc[:, j]))
+                    output.append((values, names))
+        else:
+            if axis == 0:
+                for row in matrix:
+                    values, names = _result_to_array(fun(row))
+                    output.append((values, names))
+            else:
+                transposed = matrix.T
+                for col in transposed:
+                    values, names = _result_to_array(fun(col))
+                    output.append((values, names))
+        if not output:
+            return np.array([])
+
+        lens = [len(values) for values, _ in output]
+        if all(l == 1 for l in lens):
+            vals = np.array([float(values[0]) if np.ndim(values[0]) == 0 else values[0] for values, _ in output])
+            if "pd" in globals() and isinstance(matrix, pd.DataFrame) and axis in {0, 1}:
+                labels = row_names if axis == 0 else col_names
+                if labels is not None:
+                    return RNamedVector(vals, labels)
+            return vals
+
+        if all(l == lens[0] for l in lens):
+            values = [values for values, _ in output]
+            stacked = np.column_stack(values)
+            if "pd" in globals() and isinstance(matrix, pd.DataFrame):
+                first_names = output[0][1]
+                index = first_names if first_names else [str(i) for i in range(stacked.shape[0])]
+                columns = col_names if axis == 1 else row_names
+                return pd.DataFrame(stacked, index=index, columns=columns)
+            return stacked
+
+        return np.array([v for values, _ in output], dtype=object)
+
     arr = np.asarray(x)
-    keep_axes = np.atleast_1d(margin).astype(int) - 1
+    try:
+        keep_axes = np.atleast_1d(margin).astype(int) - 1
+    except Exception:
+        keep_axes = np.atleast_1d(int(margin))
+        keep_axes = keep_axes - 1
+    axis = 0
+    if keep_axes.size:
+        axis = int(keep_axes[0])
+    if axis < 0:
+        axis = 0
+    if axis >= arr.ndim:
+        axis = 0
+
+    if "pd" in globals() and isinstance(x, pd.DataFrame):
+        matrix_result = _apply_to_matrix(x, axis)
+        if matrix_result is not None:
+            return matrix_result
+
+    matrix_result = _apply_to_matrix(arr, axis)
+    if matrix_result is not None:
+        return matrix_result
+
     reduce_axes = tuple(axis for axis in range(arr.ndim) if axis not in set(keep_axes))
     if func == "sum":
         return np.sum(arr, axis=reduce_axes)
@@ -1242,6 +1344,12 @@ def r_date_seq(start, stop, by):
 
 
 def r_diff(x):
+    if "pd" in globals() and isinstance(x, pd.DataFrame):
+        arr = np.asarray(x)
+        out = np.diff(arr, axis=0) if arr.ndim >= 2 else np.diff(arr)
+        if np.issubdtype(np.asarray(out).dtype, np.timedelta64):
+            out = (out / np.timedelta64(1, "D")).astype(int)
+        return pd.DataFrame(out, index=x.index[1:], columns=x.columns)
     arr = np.asarray(x)
     out = np.diff(arr, axis=0) if arr.ndim >= 2 else np.diff(arr)
     if np.issubdtype(np.asarray(out).dtype, np.timedelta64):
@@ -1381,9 +1489,41 @@ def r_matrix_index_set(x, idx, value):
     return x
 """.strip()
         )
-    if "r_subset(" in python or "r_set_subset(" in python or "r_subset_df(" in python or "r_with(" in python or "r_within(" in python:
+    if "r_subset(" in python or "r_matrix_row_named(" in python or "r_set_subset(" in python or "r_subset_df(" in python or "r_with(" in python or "r_within(" in python:
         helpers.append(
             """
+def r_matrix_row_named(x, row, colnames=None):
+    if isinstance(x, pd.DataFrame):
+        rows = x.iloc[row, :] if not (isinstance(row, str) and row == ":") else x
+        if isinstance(rows, pd.Series):
+            arr = rows.to_numpy()
+            cols = x.columns
+            if colnames is None:
+                colnames = cols
+            if np.asarray(arr).size != len(cols):
+                return arr
+            if "RNamedVector" not in globals():
+                return arr
+            return RNamedVector(np.asarray(arr), list(cols if colnames is None else colnames))
+        return rows
+    row_values = np.asarray(x)[row]
+    if np.asarray(x).ndim != 2 or not isinstance(row, (int, np.integer, np.ndarray, list, tuple, slice)):
+        return row_values
+    if isinstance(row_values, (int, float, np.floating, np.integer, np.number)):
+        return row_values
+    arr = np.asarray(row_values)
+    if arr.ndim != 1:
+        return arr
+    if colnames is None:
+        return arr
+    if "RNamedVector" not in globals():
+        return arr
+    cols = np.asarray(colnames)
+    if np.asarray(row_values).size != cols.size:
+        return arr
+    return RNamedVector(arr, list(cols))
+
+
 def r_subset(x, *keys):
     if isinstance(x, pd.DataFrame):
         if len(keys) == 1:
@@ -1475,9 +1615,26 @@ def r_set_subset(x, value, *keys):
 
 
 def r_col_key(x, name, colnames=None):
-    if isinstance(x, pd.DataFrame):
+    if isinstance(colnames, str):
+        colnames = globals().get(colnames)
+    if isinstance(colnames, np.ndarray):
+        colnames = colnames.tolist()
+    if isinstance(colnames, pd.Index):
+        colnames = colnames.tolist()
+    if isinstance(name, (list, tuple, np.ndarray)):
+        return [r_col_key(x, item, colnames) for item in np.asarray(name).ravel()]
+    if colnames is None:
+        if isinstance(x, pd.DataFrame):
+            return name
         return name
-    return colnames.index(name)
+    cols = list(colnames)
+    if name in cols:
+        return cols.index(name)
+    if isinstance(name, str):
+        for i, item in enumerate(cols):
+            if str(item) == name:
+                return i
+    raise KeyError(name)
 
 
 def r_row_key(x, name, rownames=None):
@@ -2040,6 +2197,142 @@ nagarch_var_fast = _nagarch_njit(cache=True)(_nagarch_var_fast_impl) if _nagarch
 nagarch_var_fast = _nagarch_var_fast_impl
 """.strip()
             )
+    if "def garch_negloglik(" in python:
+        garch_nll = """
+import math as _math
+
+def _garch_negloglik_fast_impl(par, x):
+    par = np.asarray(par, dtype=np.float64).ravel()
+    x = np.asarray(x, dtype=np.float64).ravel()
+    if par.size < 5 or x.size == 0:
+        return 1e100
+    mu = par[0]
+    omega = np.exp(par[1])
+    ea = np.exp(par[2])
+    eb = np.exp(par[3])
+    denom = 1.0 + ea + eb
+    if not np.isfinite(denom) or denom <= 0.0:
+        return 1e100
+    alpha = 0.999 * ea / denom
+    beta = 0.999 * eb / denom
+    nu = 2.01 + np.exp(par[4])
+    e = x - mu
+    h = np.zeros(x.shape[0])
+    persistence = 1.0 - alpha - beta
+    if not np.isfinite(persistence) or persistence <= 0.0:
+        return 1e100
+    h0 = omega / persistence
+    if (not np.isfinite(h0)) or h0 <= 0.0:
+        h0 = np.sum((e - np.mean(e)) ** 2) / (e.size - 1) if e.size > 1 else e[0] ** 2
+        if not np.isfinite(h0) or h0 <= 0.0:
+            return 1e100
+    h[0] = np.maximum(h0, 1e-08)
+    for t in range(1, x.size):
+        zlag = e[t - 1] ** 2
+        h[t] = omega + alpha * zlag + beta * h[t - 1]
+        if not np.isfinite(h[t]) or h[t] <= 0.0:
+            return 1e100
+    if not np.isfinite(nu) or nu <= 2.0:
+        return 1e100
+    lognorm = _math.lgamma(0.5 * (nu + 1.0)) - _math.lgamma(0.5 * nu) - 0.5 * _math.log((nu - 2.0) * np.pi)
+    loglik = np.sum(lognorm - 0.5 * (nu + 1.0) * np.log1p((e * e) / (h * (nu - 2.0))) - 0.5 * np.log(h))
+    if not np.isfinite(loglik):
+        return 1e100
+    return -loglik
+""".strip()
+        if use_numba:
+            helpers.append(
+                f"""
+try:
+    from numba import njit as _garch_njit
+except Exception:
+    _garch_njit = None
+
+
+{garch_nll}
+
+
+garch_negloglik_fast = _garch_njit(cache=True)(_garch_negloglik_fast_impl) if _garch_njit is not None else _garch_negloglik_fast_impl
+""".strip()
+            )
+        else:
+            helpers.append(
+                f"""
+{garch_nll}
+
+
+garch_negloglik_fast = _garch_negloglik_fast_impl
+""".strip()
+            )
+    if "def nagarch_negloglik(" in python:
+        nagarch_nll = """
+import math as _math
+
+def _nagarch_negloglik_fast_impl(par, x):
+    par = np.asarray(par, dtype=np.float64).ravel()
+    x = np.asarray(x, dtype=np.float64).ravel()
+    if par.size < 6 or x.size == 0:
+        return 1e100
+    mu = par[0]
+    omega = np.exp(par[1])
+    theta = par[2]
+    ea = np.exp(par[3])
+    eb = np.exp(par[4])
+    denom = 1.0 + ea + eb
+    if not np.isfinite(denom) or denom <= 0.0:
+        return 1e100
+    alpha_star = 0.999 * ea / denom
+    alpha = alpha_star / (1.0 + theta ** 2)
+    beta = 0.999 * eb / denom
+    nu = 2.01 + np.exp(par[5])
+    e = x - mu
+    h = np.zeros(x.shape[0])
+    persistence = 1.0 - alpha * (1.0 + theta ** 2) - beta
+    if not np.isfinite(persistence) or persistence <= 0.0:
+        return 1e100
+    h0 = omega / persistence
+    if (not np.isfinite(h0)) or h0 <= 0.0:
+        h0 = np.sum((e - np.mean(e)) ** 2) / (e.size - 1) if e.size > 1 else e[0] ** 2
+        if not np.isfinite(h0) or h0 <= 0.0:
+            return 1e100
+    h[0] = np.maximum(h0, 1e-08)
+    for t in range(1, x.size):
+        centered = e[t - 1] - theta * np.sqrt(h[t - 1])
+        h[t] = omega + alpha * (centered ** 2) + beta * h[t - 1]
+        if not np.isfinite(h[t]) or h[t] <= 0.0:
+            return 1e100
+    if not np.isfinite(nu) or nu <= 2.0:
+        return 1e100
+    lognorm = _math.lgamma(0.5 * (nu + 1.0)) - _math.lgamma(0.5 * nu) - 0.5 * _math.log((nu - 2.0) * np.pi)
+    loglik = np.sum(lognorm - 0.5 * (nu + 1.0) * np.log1p((e * e) / (h * (nu - 2.0))) - 0.5 * np.log(h))
+    if not np.isfinite(loglik):
+        return 1e100
+    return -loglik
+""".strip()
+        if use_numba:
+            helpers.append(
+                f"""
+try:
+    from numba import njit as _nagarch_njit
+except Exception:
+    _nagarch_njit = None
+
+
+{nagarch_nll}
+
+
+nagarch_negloglik_fast = _nagarch_njit(cache=True)(_nagarch_negloglik_fast_impl) if _nagarch_njit is not None else _nagarch_negloglik_fast_impl
+""".strip()
+            )
+        else:
+            helpers.append(
+                f"""
+{nagarch_nll}
+
+
+nagarch_negloglik_fast = _nagarch_negloglik_fast_impl
+""".strip()
+            )
     if "r_print(" in python or "r_s3_print(" in python or "r_s3_dispatch(" in python:
         helpers.append(
             """
@@ -2072,9 +2365,21 @@ def r_print(*args, digits=None, colnames=None):
     elif "pd" in globals() and isinstance(x, pd.DatetimeIndex):
         print(" ".join(x.strftime("%Y-%m-%d").to_list()))
     elif "pd" in globals() and isinstance(x, pd.DataFrame):
-        print(x.to_string(index=False))
+        print(x.to_string())
     elif "pd" in globals() and isinstance(x, pd.Series):
-        print(" ".join(r_format(v, digits) for v in x.to_numpy()))
+        values = [r_format(v, digits) for v in x.to_numpy()]
+        if x.index.dtype == bool:
+            labels = [str(v) for v in x.index.tolist()]
+        else:
+            labels = [str(v) for v in x.index]
+        if colnames is not None:
+            labels = [str(label) for label in colnames]
+        if len(labels) == len(values):
+            widths = [max(len(label), len(value)) for label, value in zip(labels, values)]
+            print(" ".join(labels[j].rjust(widths[j]) for j in range(len(labels))))
+            print(" ".join(values[j].rjust(widths[j]) for j in range(len(values))))
+        else:
+            print(" ".join(values))
     elif "RNamedVector" in globals() and isinstance(x, RNamedVector):
         labels = [str(label) for label in x.names]
         values = [r_format(v, digits) for v in x.values]
@@ -2151,15 +2456,41 @@ def r_range(start, stop):
         helpers.append(
             """
 def r_recycle_binary(x, y, op):
+    x_meta = x
+    y_meta = y
+    has_pd = "pd" in globals()
     x = np.asarray(x)
     y = np.asarray(y)
     if x.ndim == 0 or y.ndim == 0:
-        return _RRECYCLE_OPS[op](x, y)
+        out = _RRECYCLE_OPS[op](x, y)
+        out_arr = np.asarray(out)
+        if has_pd and isinstance(x_meta, pd.DataFrame) and out_arr.shape == np.asarray(x_meta).shape:
+            return pd.DataFrame(out_arr, index=x_meta.index, columns=x_meta.columns)
+        if has_pd and isinstance(y_meta, pd.DataFrame) and out_arr.shape == np.asarray(y_meta).shape:
+            return pd.DataFrame(out_arr, index=y_meta.index, columns=y_meta.columns)
+        return out
     if x.ndim == 1 and y.ndim == 1 and x.shape[0] != y.shape[0]:
         n = max(x.shape[0], y.shape[0])
         x = np.resize(x, n)
         y = np.resize(y, n)
-    return _RRECYCLE_OPS[op](x, y)
+    out = _RRECYCLE_OPS[op](x, y)
+    if has_pd:
+        out_arr = np.asarray(out)
+        if isinstance(x_meta, pd.DataFrame):
+            if out_arr.shape == x_meta.shape:
+                return pd.DataFrame(out, index=x_meta.index, columns=x_meta.columns)
+            if out_arr.ndim == 1 and out_arr.shape[0] == x_meta.shape[0]:
+                return pd.Series(out_arr, index=x_meta.index, name=getattr(x_meta, "name", None))
+            if out_arr.ndim == 2 and out_arr.shape[0] == x_meta.shape[0] and out_arr.shape[1] == 1:
+                return pd.DataFrame(out, index=x_meta.index)
+        if isinstance(y_meta, pd.DataFrame):
+            if out_arr.shape == y_meta.shape:
+                return pd.DataFrame(out, index=y_meta.index, columns=y_meta.columns)
+            if out_arr.ndim == 1 and out_arr.shape[0] == y_meta.shape[0]:
+                return pd.Series(out_arr, index=y_meta.index)
+            if out_arr.ndim == 2 and out_arr.shape[0] == y_meta.shape[0] and out_arr.shape[1] == 1:
+                return pd.DataFrame(out, index=y_meta.index)
+    return out
 
 
 def r_add(x, y):
@@ -2479,6 +2810,24 @@ def inject_known_fast_paths(python: str) -> str:
             (
                 "def nagarch_var(eps, omega, alpha, beta, theta):\n"
                 "    return nagarch_var_fast(eps, omega, alpha, beta, theta)\n"
+            ),
+            1,
+        )
+    if "def garch_negloglik(" in python and "garch_negloglik_fast(" not in python:
+        python = python.replace(
+            "def garch_negloglik(par, x):\n",
+            (
+                "def garch_negloglik(par, x):\n"
+                "    return garch_negloglik_fast(np.asarray(par, dtype=float), np.asarray(x, dtype=float))\n"
+            ),
+            1,
+        )
+    if "def nagarch_negloglik(" in python and "nagarch_negloglik_fast(" not in python:
+        python = python.replace(
+            "def nagarch_negloglik(par, x):\n",
+            (
+                "def nagarch_negloglik(par, x):\n"
+                "    return nagarch_negloglik_fast(np.asarray(par, dtype=float), np.asarray(x, dtype=float))\n"
             ),
             1,
         )
@@ -3308,8 +3657,8 @@ def translate_expr(expr: str) -> str:
     expr, strings = mask_string_literals(expr)
     expr = translate_expr_code(expr)
     expr = restore_string_literals(expr, strings)
-    for i, text in enumerate(strings):
-        expr = expr.replace(f"__R_ATTR_{i}__", r_name(text[1:-1]))
+    for i, (_, text) in enumerate(strings):
+        expr = expr.replace(f"__R_ATTR_{i}__", text)
     return expr
 
 
@@ -3349,6 +3698,7 @@ def translate_expr_code(expr: str) -> str:
     expr = replace_nested_matrix_subscripts(expr)
     expr = replace_nested_vector_subscripts(expr)
     expr = replace_calls(expr)
+    expr = replace_r_colnames_array_subscripts(expr)
     expr = replace_matrix_vector_recycling(expr)
     expr = replace_named_matrix_columns(expr)
     expr = replace_vector_not(expr)
@@ -3564,7 +3914,9 @@ def replace_innermost_call(expr: str) -> str:
 
 
 def replace_r_subscripts(expr: str) -> str:
-    item_pattern = re.compile(r"([A-Za-z]\w*(?:(?:@@MEM@@|\.)\w+)*)\s*\[\[([^\[\]]+)\]\]")
+    item_pattern = re.compile(
+        r"([A-Za-z]\w*(?:(?:@@MEM@@|\.)\w+)*(?:\([^]]*\))?)\s*\[\[([^\[\]]+)\]\]"
+    )
     expr = item_pattern.sub(replace_double_subscript, expr)
     pattern = re.compile(r"([A-Za-z]\w*(?:(?:@@MEM@@|\.)\w+)*)\s*\[([^\[\]]*)\]")
     return pattern.sub(replace_single_subscript, expr)
@@ -3593,14 +3945,56 @@ def replace_nested_vector_subscripts(expr: str) -> str:
     return pattern.sub(repl, expr)
 
 
+def replace_r_colnames_array_subscripts(expr: str) -> str:
+    pattern = re.compile(
+        r"np\.array\((globals\(\)\.get\([^)]*?_colnames[^)]*\))\)\[([^\]]+)\]"
+    )
+
+    def repl(match: re.Match[str]) -> str:
+        base = match.group(1)
+        idx = match.group(2).strip()
+        if idx in {":", "slice(None)"}:
+            return f"np.array({base})[{idx}]"
+        if is_string_index_expr(idx):
+            return f"np.array({base})[{idx}]"
+        if idx.startswith("r_sub("):
+            return f"np.array({base})[{idx}]"
+        return f"np.array({base})[r_sub({idx}, 1)]"
+
+    return pattern.sub(repl, expr)
+
+
 def replace_double_subscript(match: re.Match[str]) -> str:
-    base = translate_member_expr(match.group(1))
+    raw_base = match.group(1).strip()
+    parsed_call = parse_full_call(raw_base)
+    if parsed_call is not None:
+        base = translate_call(parsed_call[0], parsed_call[1])
+    else:
+        open_pos = -1
+        if raw_base.endswith(")"):
+            depth = 0
+            for i in range(len(raw_base) - 1, -1, -1):
+                if raw_base[i] == ")":
+                    depth += 1
+                elif raw_base[i] == "(":
+                    depth -= 1
+                    if depth == 0:
+                        open_pos = i
+                        break
+        if open_pos >= 0:
+            base = f"{translate_member_expr(raw_base[:open_pos])}({raw_base[open_pos + 1:-1]})"
+        else:
+            base = translate_member_expr(raw_base)
     index = match.group(2).strip()
     if is_string_literal(index):
+        if base.endswith(")"):
+            return f"r_list_get({base}, {index})"
         return f"{base}.{r_name(index[1:-1])}"
     placeholder = re.fullmatch(r"__R_STR_(\d+)__", index)
     if placeholder:
-        return f"{base}.__R_ATTR_{placeholder.group(1)}__"
+        if base.endswith(")"):
+            return f"r_list_get({base}, __R_STR_{placeholder.group(1)}__)"
+        return f"{base}.__R_STR_{placeholder.group(1)}__"
     if re.fullmatch(r"\d+", index):
         return f"r_list_get({base}, {index})"
     return f"r_list_get({base}, {translate_expr(index)})"
@@ -4117,9 +4511,10 @@ def translate_call(name: str, args: list[str]) -> str:
         if len(print_args) == 1:
             raw_call = parse_full_call(print_args[0])
             if raw_call is not None and raw_call[0].lower() == "round" and len(raw_call[1]) >= 2:
+                inner = print_py_args[0]
                 return (
                     "r_print("
-                    + print_py_args[0]
+                    + inner
                     + ", digits="
                     + translate_expr(raw_call[1][1])
                     + print_colnames_arg(raw_call[1][0], allow_simple=True)
@@ -4298,7 +4693,7 @@ def translate_call(name: str, args: list[str]) -> str:
     if lname == "as.vector":
         return "np.ravel(" + py_args[0] + ", order='F')"
     if lname == "as.matrix":
-        return "np.asarray(" + py_args[0] + ")"
+        return "r_as_matrix(" + py_args[0] + ")"
     if lname == "scale":
         return f"(({py_args[0]} - np.mean({py_args[0]}, axis=0)) / np.std({py_args[0]}, axis=0, ddof=1))"
     if lname == "attr":
@@ -4498,6 +4893,8 @@ def print_colnames_arg(raw_expr: str, *, allow_simple: bool = False) -> str:
     raw_call = parse_full_call(expr)
     if raw_call is not None and raw_call[0].lower() in {"head", "tail"} and raw_call[1]:
         return print_colnames_arg(raw_call[1][0], allow_simple=allow_simple)
+    if raw_call is not None and raw_call[0].lower() in {"round", "signif"} and raw_call[1]:
+        return print_colnames_arg(raw_call[1][0], allow_simple=allow_simple)
     if raw_call is not None and raw_call[0].lower() == "cbind":
         names = cbind_arg_names(raw_call[1])
         if names:
@@ -4593,8 +4990,7 @@ def translate_apply_call(args: list[str]) -> str:
         return f"r_apply({x}, {margin}, 'min')"
     if func in {"max", "np.max"}:
         return f"r_apply({x}, {margin}, 'max')"
-    axis = "0" if margin == "2" else "1"
-    return f"np.apply_along_axis({func}, {axis}, {x})"
+    return f"r_apply({x}, {margin}, {func})"
 
 
 def translate_lm_call(args: list[str]) -> str:
@@ -5500,6 +5896,8 @@ def translate_call_arg(arg: str) -> str:
     pos = find_top_level_operator(arg, "=")
     if pos < 0:
         return translate_expr(arg)
+    if pos > 0 and (arg[pos - 1] in "<>!" or (pos + 1 < len(arg) and arg[pos + 1] == "=")):
+        return translate_expr(arg)
     key = normalize_keyword_name(arg[:pos].strip())
     value = arg[pos + 1 :].strip()
     return f"{key}={translate_expr(value)}"
@@ -5706,9 +6104,13 @@ def strip_r_comment(line: str) -> str:
     return line
 
 
-def mask_string_literals(expr: str) -> tuple[str, list[str]]:
+_STRING_PLACEHOLDER_ID = 0
+
+
+def mask_string_literals(expr: str) -> tuple[str, list[tuple[str, str]]]:
+    global _STRING_PLACEHOLDER_ID
     parts: list[str] = []
-    strings: list[str] = []
+    strings: list[tuple[str, str]] = []
     current: list[str] = []
     quote = ""
     i = 0
@@ -5717,8 +6119,9 @@ def mask_string_literals(expr: str) -> tuple[str, list[str]]:
         if quote:
             current.append(ch)
             if ch == quote:
-                placeholder = f"__R_STR_{len(strings)}__"
-                strings.append("".join(current))
+                placeholder = f"__R_STR_{_STRING_PLACEHOLDER_ID}__"
+                _STRING_PLACEHOLDER_ID += 1
+                strings.append((placeholder, "".join(current)))
                 parts.append(placeholder)
                 current = []
                 quote = ""
@@ -5738,9 +6141,9 @@ def mask_string_literals(expr: str) -> tuple[str, list[str]]:
     return "".join(parts), strings
 
 
-def restore_string_literals(expr: str, strings: list[str]) -> str:
-    for i, text in enumerate(strings):
-        expr = expr.replace(f"__R_STR_{i}__", text)
+def restore_string_literals(expr: str, strings: list[tuple[str, str]]) -> str:
+    for placeholder, text in strings:
+        expr = expr.replace(placeholder, text)
     return expr
 
 
@@ -6147,7 +6550,11 @@ def is_program_specific_runtime_block(block: list[str]) -> bool:
         for token in (
             "_nagarch_var_fast_impl",
             "_arma_residuals_fast_impl",
+            "_garch_negloglik_fast_impl",
+            "_nagarch_negloglik_fast_impl",
             "nagarch_var_fast",
+            "garch_negloglik_fast",
+            "nagarch_negloglik_fast",
             "arma_residuals_fast",
             "varma_resid_fast",
         )
