@@ -1246,6 +1246,17 @@ def r_diff(x):
     return out
 """.strip()
         )
+    if "proc_time(" in python:
+        helpers.append(
+            """
+def proc_time():
+    import time as _r_time
+    return RNamedVector(
+        np.array([0.0, 0.0, float(_r_time.perf_counter()), 0.0, 0.0], dtype=float),
+        ["user.self", "sys.self", "elapsed", "user.child", "sys.child"],
+    )
+""".strip()
+        )
     if "r_split(" in python or "r_unsplit(" in python:
         helpers.append(
             """
