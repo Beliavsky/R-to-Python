@@ -30,6 +30,7 @@ NAMED_VECTOR_VARS: set[str] = set()
 DOTTED_R_VARS: set[str] = set()
 CHARACTER_VECTOR_VARS: set[str] = set()
 LOGICAL_VECTOR_VARS: set[str] = set()
+MATRIX_VARS: set[str] = set()
 
 
 @dataclass
@@ -43,13 +44,14 @@ class R2PyError(Exception):
     pass
 
 
-def translate_source(source: str, *, use_numba: bool = True) -> str:
+def translate_source(source: str, *, use_numba: bool = True, source_name: str | None = None, banner: bool = True) -> str:
     USER_FUNCTION_PARAMS.clear()
     USER_FUNCTION_NAMES.clear()
     NAMED_VECTOR_VARS.clear()
     DOTTED_R_VARS.clear()
     CHARACTER_VECTOR_VARS.clear()
     LOGICAL_VECTOR_VARS.clear()
+    MATRIX_VARS.clear()
     global PENDING_FUNCTION_PARAMS
     PENDING_FUNCTION_PARAMS = None
     _LAMBDA_MASKS.clear()
@@ -142,6 +144,9 @@ def translate_source(source: str, *, use_numba: bool = True) -> str:
     if "time." in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nimport time\n", 1)
     python = remove_unused_numpy_import(python)
+    if banner and source_name:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        python = f"# Translated from {source_name} by xr2p.py on {stamp}.\n{python}"
     return python
 
 
@@ -1931,13 +1936,23 @@ def r_tapply(x, group, func):
     return RNamedVector(np.array(out), levels)
 
 
-def cut_py(x, breaks):
+def cut_py(x, breaks, labels=None):
     values = np.asarray(x)
     breaks = np.asarray(breaks)
-    labels = [f"({breaks[i]},{breaks[i + 1]}]" for i in range(len(breaks) - 1)]
+    if breaks.ndim == 0:
+        # R: a single number gives that many intervals over the data range,
+        # extended by 0.1 percent on each side.
+        count = int(breaks)
+        lo = float(np.min(values))
+        hi = float(np.max(values))
+        pad = (hi - lo) * 0.001 or 0.001
+        breaks = np.linspace(lo - pad, hi + pad, count + 1)
+    level_names = [f"({breaks[i]},{breaks[i + 1]}]" for i in range(len(breaks) - 1)]
     idx = np.searchsorted(breaks, values, side="left") - 1
-    idx = np.clip(idx, 0, len(labels) - 1)
-    return RFactor(np.array([labels[i] for i in idx]), levels=labels, ordered=True)
+    idx = np.clip(idx, 0, len(level_names) - 1)
+    if labels is False:
+        return idx + 1
+    return RFactor(np.array([level_names[i] for i in idx]), levels=level_names, ordered=True)
 
 
 def r_df_col(x):
@@ -2644,6 +2659,14 @@ def r_recycle_binary(x, y, op):
         n = max(x.shape[0], y.shape[0])
         x = np.resize(x, n)
         y = np.resize(y, n)
+    if x.ndim == 2 and y.ndim == 1:
+        flat = x.ravel(order="F")
+        out = _RRECYCLE_OPS[op](flat, np.resize(y, flat.shape[0]))
+        return out.reshape(x.shape, order="F")
+    if x.ndim == 1 and y.ndim == 2:
+        flat = y.ravel(order="F")
+        out = _RRECYCLE_OPS[op](np.resize(x, flat.shape[0]), flat)
+        return out.reshape(y.shape, order="F")
     out = _RRECYCLE_OPS[op](x, y)
     if has_pd:
         out_arr = np.asarray(out)
@@ -3093,14 +3116,59 @@ def return_function_tail_expressions(python: str) -> str:
         end = start
         while end < len(lines) and (not lines[end] or lines[end].startswith((" ", "\t"))):
             end += 1
-        j = end - 1
-        while j >= start and not lines[j].strip():
-            j -= 1
-        if j >= start and should_return_tail_expression(lines[j]):
-            indent = lines[j][: len(lines[j]) - len(lines[j].lstrip())]
-            out[j] = indent + "return " + lines[j].strip()
+        if not add_branch_tail_returns(out, start, end, INDENT):
+            j = end - 1
+            while j >= start and not lines[j].strip():
+                j -= 1
+            if j >= start and should_return_tail_expression(lines[j]):
+                indent = lines[j][: len(lines[j]) - len(lines[j].lstrip())]
+                out[j] = indent + "return " + lines[j].strip()
         i = end
     return "\n".join(out).rstrip() + "\n"
+
+
+def add_branch_tail_returns(out: list[str], start: int, end: int, indent: str) -> bool:
+    """Add returns to each branch when the block's tail statement is an if/elif/else chain.
+
+    Returns True when the tail statement was an if-chain and has been handled.
+    """
+    headers = [
+        j
+        for j in range(start, end)
+        if out[j].strip()
+        and out[j].startswith(indent)
+        and len(out[j]) > len(indent)
+        and not out[j][len(indent)].isspace()
+        and not out[j].lstrip().startswith("#")
+    ]
+    if not headers:
+        return False
+    last = headers[-1]
+    if not re.match(r"^(?:if\b.*|elif\b.*|else\s*):\s*$", out[last].strip()):
+        return False
+    # Walk backward to the start of the if/elif/else chain.
+    chain = [last]
+    pos = len(headers) - 1
+    while re.match(r"^(?:elif\b.*|else\s*):\s*$", out[chain[0]].strip()) and pos > 0:
+        pos -= 1
+        prev = headers[pos]
+        if not re.match(r"^(?:if\b.*|elif\b.*|else\s*):\s*$", out[prev].strip()):
+            return False
+        chain.insert(0, prev)
+    if not out[chain[0]].strip().startswith("if"):
+        return False
+    boundaries = chain[1:] + [end]
+    for header, stop in zip(chain, boundaries):
+        body_start = header + 1
+        if add_branch_tail_returns(out, body_start, stop, indent + INDENT):
+            continue
+        j = stop - 1
+        while j >= body_start and not out[j].strip():
+            j -= 1
+        if j >= body_start and should_return_tail_expression(out[j]):
+            body_indent = out[j][: len(out[j]) - len(out[j].lstrip())]
+            out[j] = body_indent + "return " + out[j].strip()
+    return True
 
 
 def should_return_tail_expression(line: str) -> bool:
@@ -3842,6 +3910,10 @@ def split_assignment(line: str) -> tuple[str, str] | None:
                     LOGICAL_VECTOR_VARS.add(py_lhs)
                 else:
                     LOGICAL_VECTOR_VARS.discard(py_lhs)
+                if is_matrix_expr(rhs):
+                    MATRIX_VARS.add(py_lhs)
+                else:
+                    MATRIX_VARS.discard(py_lhs)
                 return py_lhs, rhs
             return translate_expr(lhs), rhs
     return None
@@ -4643,12 +4715,6 @@ def is_logical_vector_expr(text: str) -> bool:
         return False
     if text.upper() in {"TRUE", "FALSE", "T", "F"}:
         return True
-    if any(op in text for op in ("<", ">", "==", "!=", "<=", ">=")):
-        return True
-    if "&" in text or "|" in text:
-        return True
-    if text.startswith("!"):
-        return True
     raw_call = parse_full_call(text)
     if raw_call is not None:
         name = raw_call[0].lower()
@@ -4664,10 +4730,62 @@ def is_logical_vector_expr(text: str) -> bool:
             "grepl",
             "lower.tri",
             "upper.tri",
+            "duplicated",
+            "xor",
+            "is.element",
+            "startswith",
+            "endswith",
         }:
             return True
         if name == "c":
             return all(is_logical_scalar_expr(arg.strip()) for arg in raw_call[1]) and bool(raw_call[1])
+        # A call to any other function does not produce a logical vector even
+        # when its arguments contain comparisons, e.g. which(x == 1).
+        return False
+    # Only top-level comparisons count; ones inside subscripts or call
+    # arguments (e.g. ord[groups == j]) do not make the result logical.
+    for op in ("==", "!=", "<=", ">=", "<", ">", "&", "|"):
+        if find_top_level_operator(text, op) >= 0:
+            return True
+    if text.startswith("!"):
+        return True
+    return False
+
+
+_MATRIX_RESULT_CALLS = {
+    "matrix",
+    "as.matrix",
+    "cbind",
+    "rbind",
+    "outer",
+    "sweep",
+    "crossprod",
+    "tcrossprod",
+    "cov",
+    "cor",
+}
+
+_ELEMENTWISE_CALLS = {"exp", "log", "sqrt", "abs", "log2", "log10", "sin", "cos", "tan"}
+
+
+def is_matrix_expr(text: str) -> bool:
+    text = strip_outer_parens(text.strip())
+    if not text:
+        return False
+    if re.fullmatch(r"[A-Za-z.][\w.]*", text):
+        return r_name(text) in MATRIX_VARS
+    raw_call = parse_full_call(text)
+    if raw_call is not None:
+        name = raw_call[0].lower()
+        if name in _MATRIX_RESULT_CALLS:
+            return True
+        if name in _ELEMENTWISE_CALLS and raw_call[1]:
+            return is_matrix_expr(raw_call[1][0])
+        return False
+    for op in ("+", "-", "*", "/"):
+        pos = find_top_level_operator(text, op)
+        if pos > 0:
+            return is_matrix_expr(text[:pos]) or is_matrix_expr(text[pos + 1 :])
     return False
 
 
@@ -5134,6 +5252,10 @@ def translate_call(name: str, args: list[str]) -> str:
         if len(args) >= 2:
             return f"isinstance({py_args[0]}, TryError)"
         return "False"
+    if lname in {"forwardsolve", "backsolve"}:
+        parts = [translate_expr(arg) for arg in positional_args(args)[:2]]
+        lower = "True" if lname == "forwardsolve" else "False"
+        return f"linalg.solve_triangular({parts[0]}, {parts[1]}, lower={lower})"
     if lname == "strsplit":
         parts = [translate_expr(arg) for arg in positional_args(args)[:2]]
         fixed = translate_expr(keyword_arg(args, "fixed", default="FALSE"))
@@ -5177,7 +5299,9 @@ def translate_call(name: str, args: list[str]) -> str:
         return "np.searchsorted(" + vec + ", " + py_args[0] + ", side='right')"
     if lname == "cut":
         breaks = translate_expr(keyword_arg(args, "breaks", default=args[1] if len(args) > 1 else None))
-        return "cut_py(" + py_args[0] + ", " + breaks + ")"
+        labels_arg = keyword_arg(args, "labels")
+        labels_part = "" if labels_arg is None else f", labels={translate_expr(labels_arg)}"
+        return "cut_py(" + py_args[0] + ", " + breaks + labels_part + ")"
     if lname == "range":
         xarg = py_args[0] if py_args else "np.array([])"
         na_rm = keyword_arg(args, "na.rm", default="False")
@@ -6403,6 +6527,9 @@ def apply_recycled_binops(expr: str) -> str:
         if isinstance(node, ast.Constant):
             return isinstance(node.value, (int, float, complex, bool))
         if isinstance(node, ast.Name):
+            if node.id in MATRIX_VARS:
+                # Matrix operands may need R column-major recycling.
+                return False
             return len(node.id) > 1 or node.id in {"x", "y"}
         if isinstance(node, ast.Attribute):
             return True
@@ -7246,6 +7373,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prune-runtime", action="store_true", help="with --runtime-module, keep only runtime helpers needed by the generated script")
     parser.add_argument("--update-runtime", action="store_true", help="overwrite xr2p_runtime.py when --runtime-module is used")
     parser.add_argument("--no-numba", action="store_true", help="do not emit generated code that imports or uses numba")
+    parser.add_argument("--no-banner", action="store_true", help="do not emit the translated-from banner comment")
     parser.add_argument("--no-py-compile", action="store_true", help="skip python -m py_compile check")
     parser.add_argument("--run", action="store_true", help="run the generated Python")
     parser.add_argument("--time", action="store_true", help="run the generated Python and print transpilation and run elapsed times")
@@ -7331,7 +7459,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         source = args.source.read_text(encoding="utf-8-sig")
         translate_start = time.perf_counter()
-        python = translate_source(source, use_numba=not args.no_numba)
+        python = translate_source(source, use_numba=not args.no_numba, source_name=str(args.source), banner=not args.no_banner)
         translate_elapsed = time.perf_counter() - translate_start
     except (OSError, R2PyError) as exc:
         print(f"xr2p: {exc}", file=sys.stderr)
