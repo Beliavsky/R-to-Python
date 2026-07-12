@@ -52,6 +52,7 @@ def translate_source(source: str, *, use_numba: bool = True) -> str:
     LOGICAL_VECTOR_VARS.clear()
     global PENDING_FUNCTION_PARAMS
     PENDING_FUNCTION_PARAMS = None
+    _LAMBDA_MASKS.clear()
     out = ["import numpy as np", ""]
     indent = 0
     for line in logical_r_lines(preprocess_simple_inline_r(source)):
@@ -79,13 +80,14 @@ def translate_source(source: str, *, use_numba: bool = True) -> str:
         if opens:
             indent += 1
     python = "\n".join(out).rstrip() + "\n"
+    python = restore_lambda_masks(python)
     python = zero_base_unused_counter_loops(python)
     python = return_function_tail_expressions(python)
     python = resolve_nonlocal_assignments(python)
     python = add_blank_lines_after_functions(python)
     python = add_pass_to_empty_blocks(python)
     python = repair_generated_syntax_cleanup(python)
-    if "stats." in python or "aov_py(" in python:
+    if "stats." in python or "aov_py(" in python or "kruskal_test_py(" in python or "wilcox_test_py(" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom scipy import stats as r_stats\n", 1)
         python = python.replace("stats.", "r_stats.")
     if "optimize." in python or "uniroot_py(" in python or re.search(r"(?<![\w.])fsolve(?![\w.])", python):
@@ -179,7 +181,13 @@ def expand_chained_assignment(line: str) -> list[str]:
     if nested is None:
         return [line]
     mid_lhs, mid_rhs = nested
+    if not (is_chain_assignment_target(lhs) and is_chain_assignment_target(mid_lhs)):
+        return [line]
     return [f"{mid_lhs} <- {mid_rhs}", f"{lhs} <- {mid_lhs}"]
+
+
+def is_chain_assignment_target(text: str) -> bool:
+    return re.fullmatch(r"[A-Za-z.][\w.]*\s*(?:\[\[?[^\[\]]*\]?\]|\$[\w.]+)?", text.strip()) is not None
 
 
 def strict_raw_assignment(line: str) -> tuple[str, str] | None:
@@ -258,7 +266,7 @@ def r_line_continues(line: str) -> bool:
         return True
     if stripped.endswith("=") and len(stripped) >= 2 and stripped[-2] not in {"=", "!", "<", ">"}:
         return True
-    return bool(re.search(r"(%[^%\s]+%|\+|-|\*|/|\||&|,)\s*$", stripped))
+    return bool(re.search(r"(%[^%\s]+%|\|>|\+|-|\*|/|\||&|,)\s*$", stripped))
 
 
 def has_unbalanced_delimiters(text: str) -> bool:
@@ -269,7 +277,7 @@ def has_unbalanced_delimiters(text: str) -> bool:
             if ch == quote:
                 quote = ""
             continue
-        if ch in {"'", '"'}:
+        if ch in {"'", '"', "`"}:
             quote = ch
         elif ch in "([":
             depth += 1
@@ -291,6 +299,10 @@ def expand_one_line_control(line: str) -> list[str]:
     assign_cond = expand_assignment_condition(line)
     if assign_cond is not None:
         return assign_cond
+    brace_else = re.match(r"^(\s*)\}\s*(else\b.*)$", line)
+    if brace_else is not None:
+        indent, tail = brace_else.groups()
+        return [f"{indent}}}", *expand_one_line_control(indent + tail)]
     if re.match(r"^\s*else\s+if\s*\(", line):
         return [line]
     parsed_else = parse_one_line_else(line)
@@ -310,6 +322,17 @@ def expand_one_line_control(line: str) -> list[str]:
         return [f"{indent}{head} {{"]
     if tail.startswith("{"):
         return [f"{indent}{head} {tail}"]
+    if head.startswith("if"):
+        split = split_top_level_else(tail)
+        if split is not None:
+            yes, no = split
+            if yes and no:
+                return [
+                    f"{indent}{head} {{",
+                    f"{indent}{INDENT}{yes}",
+                    f"{indent}}}",
+                    *expand_one_line_control(f"{indent}else {no}"),
+                ]
     return [f"{indent}{head} {{", f"{indent}{INDENT}{tail}", f"{indent}}}"]
 
 
@@ -413,6 +436,18 @@ def sanitize_python_syntax_names(python: str) -> str:
     }
     for old, new in replacements.items():
         python = re.sub(rf"(?<![\w.]){re.escape(old)}\s*\(", f"{new}(", python)
+    bare_function_refs = {
+        "is.numeric": "r_is_numeric",
+        "is.vector": "r_is_vector",
+        "is.matrix": "r_is_matrix",
+        "is.na": "np.isnan",
+        "is.nan": "np.isnan",
+        "is.finite": "np.isfinite",
+        "is.infinite": "np.isinf",
+        "is.function": "callable",
+    }
+    for old, new in bare_function_refs.items():
+        python = re.sub(rf"(?<![\w.]){re.escape(old)}(?![\w.(])", new, python)
     for name in keyword.kwlist:
         if name == "lambda":
             continue
@@ -420,6 +455,9 @@ def sanitize_python_syntax_names(python: str) -> str:
     python = normalize_dotted_call_syntax(python)
     python = re.sub(r"r_matrix_index_get\(([^,\n]+),\s*:(\d+)\)", r"r_matrix_index_get(\1, r_seq(1, \2))", python)
     python = python.replace("try_(lambda_:", "try_(lambda:")
+    # Generator-emitted lambdas can get renamed to lambda_ by replace_names;
+    # restore the keyword when the token is followed by a parameter list and colon.
+    python = re.sub(r"(?<![\w.])lambda_(?=(?::| +[A-Za-z_*][\w ,*=]*:))", "lambda", python)
     return python
 
 
@@ -441,7 +479,7 @@ def remove_unused_numpy_import(python: str) -> str:
 
 def add_runtime_helpers(python: str, *, use_numba: bool = True) -> str:
     helpers: list[str] = []
-    if "r_is_numeric(" in python or "r_is_vector(" in python or "r_is_matrix(" in python:
+    if "r_is_numeric" in python or "r_is_vector" in python or "r_is_matrix" in python:
         helpers.append(
             """
 def r_is_numeric(x):
@@ -473,6 +511,49 @@ def class_(x):
     if isinstance(x, np.ndarray):
         return np.array([str(x.dtype)])
     return np.array([type(x).__name__])
+""".strip()
+        )
+    if "r_format_vec(" in python:
+        helpers.append(
+            """
+def r_format_vec(x, digits=None, nsmall=None, scientific=None, width=None):
+    def fmt_one(v):
+        if isinstance(v, (bool, np.bool_)):
+            return "TRUE" if v else "FALSE"
+        if isinstance(v, (np.integer, int)):
+            s = str(int(v))
+        elif isinstance(v, (np.floating, float)):
+            if not np.isfinite(v):
+                return "NA" if np.isnan(v) else ("Inf" if v > 0 else "-Inf")
+            if scientific is True:
+                s = f"{v:.{int(digits) if digits is not None else 6}e}"
+            elif digits is not None:
+                s = f"{v:.{int(digits)}g}"
+                if scientific is False and ("e" in s or "E" in s):
+                    s = np.format_float_positional(float(s), trim="-")
+            elif v == int(v) and abs(v) < 1e15:
+                s = str(int(v))
+            else:
+                s = f"{v:.7g}"
+                if scientific is False and ("e" in s or "E" in s):
+                    s = np.format_float_positional(v, trim="-")
+            if nsmall is not None and "e" not in s and "E" not in s:
+                head, _, tail = s.partition(".")
+                if len(tail) < int(nsmall):
+                    s = head + "." + tail + "0" * (int(nsmall) - len(tail))
+        else:
+            s = str(v)
+        return s
+
+    arr = np.asarray(x)
+    if arr.ndim == 0:
+        out = fmt_one(arr.item())
+        return out.rjust(int(width)) if width is not None else out
+    strs = [fmt_one(v) for v in arr.ravel()]
+    pad = max((len(s) for s in strs), default=0)
+    if width is not None:
+        pad = max(pad, int(width))
+    return np.array([s.rjust(pad) for s in strs]).reshape(arr.shape)
 """.strip()
         )
     if "source_py(" in python:
@@ -1067,6 +1148,78 @@ def r_substr(x, start, stop):
     return out[0] if scalar else out
 """.strip()
         )
+    if "kruskal_test_py(" in python or "wilcox_test_py(" in python:
+        helpers.append(
+            """
+class RHTest:
+    def __init__(self, method, statistics, p_value):
+        self.method = method
+        self.statistics = statistics
+        self.p_value = p_value
+
+    def __str__(self):
+        parts = ", ".join(f"{name} = {value:g}" for name, value in self.statistics.items())
+        return f"\\n\\t{self.method}\\n\\n{parts}, p-value = {self.p_value:g}\\n"
+
+    __repr__ = __str__
+
+
+def kruskal_test_py(x, g):
+    g = np.asarray(getattr(g, "values", g))
+    x = np.asarray(x)
+    groups = [x[g == level] for level in np.unique(g)]
+    stat, p = r_stats.kruskal(*groups)
+    return RHTest(
+        "Kruskal-Wallis rank sum test",
+        {"Kruskal-Wallis chi-squared": float(stat), "df": len(groups) - 1},
+        float(p),
+    )
+
+
+def wilcox_test_py(x, y=None, paired=False):
+    if y is None or paired:
+        stat, p = r_stats.wilcoxon(np.asarray(x), None if y is None else np.asarray(y))
+        return RHTest("Wilcoxon signed rank test", {"V": float(stat)}, float(p))
+    stat, p = r_stats.mannwhitneyu(np.asarray(x), np.asarray(y), alternative="two-sided")
+    return RHTest("Wilcoxon rank sum test", {"W": float(stat)}, float(p))
+""".strip()
+        )
+    if "r_substr_assign(" in python:
+        helpers.append(
+            """
+def r_substr_assign(x, start, stop, value):
+    def one(s, v):
+        s = str(s)
+        start_i = max(int(start) - 1, 0)
+        stop_i = min(int(stop), len(s))
+        repl = str(v)[: max(stop_i - start_i, 0)]
+        return s[:start_i] + repl + s[start_i + len(repl):]
+
+    if np.asarray(x).ndim == 0:
+        return one(x, value)
+    values = np.atleast_1d(np.asarray(value, dtype=str))
+    return np.array([one(s, values[i % len(values)]) for i, s in enumerate(np.asarray(x, dtype=str))])
+""".strip()
+        )
+    if "r_strsplit(" in python:
+        helpers.append(
+            """
+def r_strsplit(x, split, fixed=False):
+    def split_one(s):
+        s = str(s)
+        if split == "":
+            return np.array(list(s))
+        if fixed:
+            return np.array(s.split(split))
+        return np.array(re.split(split, s))
+
+    if np.asarray(x).ndim == 0:
+        return RList(x1=split_one(x), _r_names=["x1"])
+    parts = [split_one(s) for s in np.asarray(x, dtype=str)]
+    names = [f"x{i + 1}" for i in range(len(parts))]
+    return RList(**dict(zip(names, parts)), _r_names=names)
+""".strip()
+        )
     if "head_py(" in python or "tail_py(" in python:
         helpers.append(
             """
@@ -1152,7 +1305,20 @@ def r_lapply(x, func):
 
 def r_sapply(x, func):
     names, values = r_list_items(x)
-    return RNamedVector(np.array([r_apply_func(value, func) for value in values]), names)
+    out = np.array([r_apply_func(value, func) for value in values])
+    if out.ndim == 2:
+        return out.T
+    use_names = isinstance(x, RList)
+    if not use_names:
+        try:
+            use_names = np.asarray(x).dtype.kind in {"U", "S"}
+        except Exception:
+            use_names = False
+    if use_names:
+        if not isinstance(x, RList):
+            names = [str(v) for v in np.asarray(x)]
+        return RNamedVector(out, names)
+    return out
 """.strip()
         )
     if "r_mapply(" in python:
@@ -1320,6 +1486,8 @@ def r_date_add(x, days):
 
 
 def r_date_format(x, fmt):
+    if isinstance(x, pd.Timestamp):
+        return x.strftime(fmt)
     if isinstance(x, pd.DatetimeIndex):
         return x.strftime(fmt).to_numpy()
     if isinstance(x, pd.Series) and np.issubdtype(x.dtype, np.datetime64):
@@ -1600,7 +1768,10 @@ def r_set_subset(x, value, *keys):
                 and row_arr.dtype.kind in {"i", "u"}
                 and col_arr.dtype.kind in {"i", "u"}
             ):
-                x[np.ix_(row_arr, col_arr)] = value
+                if row_arr.ndim == 0 and col_arr.ndim == 0:
+                    x[int(row_arr), int(col_arr)] = value
+                else:
+                    x[np.ix_(np.atleast_1d(row_arr), np.atleast_1d(col_arr))] = value
                 return x
         x[keys] = value
         return x
@@ -1860,7 +2031,7 @@ def r_model_matrix(data, response, terms):
     return out
 """.strip()
         )
-    if "r_c(" in python or "r_names(" in python or "r_setdiff(" in python or "RList(" in python or "RNamedVector(" in python or "r_attributes(" in python or "r_list_from_dots(" in python or "do_call_py(" in python or "rle_py(" in python or "inverse_rle_py(" in python or "summary_py(" in python or "r_table(" in python or "r_tapply(" in python or "r_lapply(" in python or "r_sapply(" in python or "r_split(" in python or "r_unsplit(" in python or "eigen_py(" in python or "svd_py(" in python or "qr_py(" in python or "determinant_py(" in python or "prcomp_py(" in python:
+    if "r_c(" in python or "r_names(" in python or "r_setdiff(" in python or "RList(" in python or "RNamedVector(" in python or "r_attributes(" in python or "r_list_from_dots(" in python or "do_call_py(" in python or "rle_py(" in python or "inverse_rle_py(" in python or "summary_py(" in python or "r_table(" in python or "r_tapply(" in python or "r_lapply(" in python or "r_sapply(" in python or "r_split(" in python or "r_unsplit(" in python or "eigen_py(" in python or "svd_py(" in python or "qr_py(" in python or "determinant_py(" in python or "prcomp_py(" in python or "r_strsplit(" in python:
         helpers.append(
             """
 class RList(SimpleNamespace):
@@ -2608,7 +2779,7 @@ def lm_py(y, x):
     coef = np.asarray(coef, dtype=float).ravel()
     fitted = design @ coef
     resid = y - fitted
-    return SimpleNamespace(kind="lm", coef=coef, coef_names=coef_names, fitted=fitted, resid=resid)
+    return SimpleNamespace(kind="lm", coef=coef, coef_names=coef_names, fitted=fitted, resid=resid, design=design)
 
 def summary_lm_py(fit):
     lines = ["Call: lm_py(y, x)", "", "Coefficients:"]
@@ -2624,7 +2795,7 @@ def glm_py(y, x, family="binomial"):
     design = np.column_stack((np.ones(len(x)), x))
     model = sm.GLM(y, design, family=sm.families.Binomial()).fit()
     coef_names = ["(Intercept)", "x"]
-    return SimpleNamespace(kind="glm", coef=np.asarray(model.params), coef_names=coef_names, fitted=np.asarray(model.fittedvalues), resid=np.asarray(model.resid_response), result=model)
+    return SimpleNamespace(kind="glm", coef=np.asarray(model.params), coef_names=coef_names, fitted=np.asarray(model.fittedvalues), resid=np.asarray(model.resid_response), result=model, design=design)
 
 def summary_glm_py(fit):
     lines = ["Call: glm_py(y, x)", "", "Coefficients:"]
@@ -2843,6 +3014,11 @@ def logical_r_lines(source: str) -> list[str]:
             lines.append(original.lstrip())
             continue
         line = strip_r_comment(original).strip()
+        # Drop LaTeX listings escape annotations found in literate R sources.
+        line = re.sub(r"\(\*@.*?@\*\)", "", line).strip()
+        line = re.sub(r"\s*_label~\w+@", "", line)
+        if "\\(" in line:
+            line = replace_lambda_shorthand(line)
         if not line:
             continue
         current.append(line)
@@ -2856,6 +3032,13 @@ def logical_r_lines(source: str) -> list[str]:
     return lines
 
 
+def replace_lambda_shorthand(line: str) -> str:
+    """Rewrite R 4.1 ``\\(x)`` lambda shorthand to ``function(x)`` outside strings."""
+    masked, strings = mask_string_literals(line)
+    masked = masked.replace("\\(", "function(")
+    return restore_string_literals(masked, strings)
+
+
 def paren_delta(line: str) -> int:
     quote = ""
     delta = 0
@@ -2864,7 +3047,7 @@ def paren_delta(line: str) -> int:
             if ch == quote:
                 quote = ""
             continue
-        if ch in {"'", '"'}:
+        if ch in {"'", '"', "`"}:
             quote = ch
         elif ch == "(":
             delta += 1
@@ -3223,17 +3406,32 @@ def translate_statement(line: str) -> list[str]:
         if re.match(r"^[A-Za-z.]\w*$", lhs):
             py_lhs = r_name(lhs)
             return [f"__R_NONLOCAL_ASSIGN__ {py_lhs}", f"{py_lhs} = {translate_expr(rhs)}"]
+        member_match = re.match(r"^([A-Za-z.]\w*)\$([\w.]+)$", lhs)
+        if member_match:
+            obj = r_name(member_match.group(1))
+            field = r_name(member_match.group(2))
+            return [f"{obj}.{field} = {translate_expr(rhs)}"]
+        # Fall back to ordinary assignment semantics for other targets.
+        return translate_statement(f"{lhs} <- {rhs}")
 
     raw_assign = raw_assignment(line)
     if raw_assign is not None:
         raw_lhs, raw_rhs = raw_assign
+        substr_assign = re.match(r"^substr(?:ing)?\s*\((.*)\)$", raw_lhs, re.IGNORECASE)
+        if substr_assign:
+            parts = split_args(substr_assign.group(1))
+            if len(parts) == 3:
+                target = translate_expr(parts[0])
+                return [f"{target} = r_substr_assign({target}, {translate_expr(parts[1])}, {translate_expr(parts[2])}, {translate_expr(raw_rhs)})"]
         raw_double_subscript_assign = re.match(r"^([A-Za-z]\w*)\[\[(.*)\]\]$", raw_lhs)
         if raw_double_subscript_assign:
             base, index = raw_double_subscript_assign.groups()
             return [f"{r_name(base)}[{translate_subscript(index, base=r_name(base))}] = {translate_expr(raw_rhs)}"]
-        raw_subscript_assign = re.match(r"^([A-Za-z]\w*)\[(.*)\]$", raw_lhs)
+        raw_subscript_assign = re.match(r"^([A-Za-z]\w*(?:\.\w+)*)\[(.*)\]$", raw_lhs)
         if raw_subscript_assign:
             base, index = raw_subscript_assign.groups()
+            if "." in base:
+                DOTTED_R_VARS.add(base)
             py_base = r_name(base)
             py_rhs = translate_expr(raw_rhs)
             if has_top_level_comma(index):
@@ -3290,14 +3488,18 @@ def translate_statement(line: str) -> list[str]:
                 py_rhs,
             )
             py_rhs = re.sub(r"(r_which_min\([^,\n]+(?:\([^)]*\)[^,\n]*)*\))(?=,\s*r_col_key)", r"(\1) - 1", py_rhs)
-        double_subscript_assign = re.match(r"^([A-Za-z]\w*)\[\[(.*)\]\]$", lhs)
+        double_subscript_assign = re.match(r"^([A-Za-z]\w*(?:\.\w+)*)\[\[(.*)\]\]$", lhs)
         if double_subscript_assign:
             base, index = double_subscript_assign.groups()
+            if "." in base:
+                DOTTED_R_VARS.add(base)
             py_base = r_name(base)
             return [f"{py_base}[{translate_subscript(index, base=py_base)}] = {py_rhs}"]
-        subscript_assign = re.match(r"^([A-Za-z]\w*)\[(.*)\]$", lhs)
+        subscript_assign = re.match(r"^([A-Za-z]\w*(?:\.\w+)*)\[(.*)\]$", lhs)
         if subscript_assign:
             base, index = subscript_assign.groups()
+            if "." in base:
+                DOTTED_R_VARS.add(base)
             py_base = r_name(base)
             if has_top_level_comma(index):
                 return [f"r_set_subset({py_base}, {py_rhs}, {translate_subscript(index, base=py_base)})"]
@@ -3410,6 +3612,13 @@ def translate_function_signature(args: str) -> tuple[str, list[str]]:
             name = r_name(raw_name)
             out.append(name)
         previous.add(name)
+    # Python requires defaults on parameters that follow defaulted ones; R does not.
+    seen_default = False
+    for i, param in enumerate(out):
+        if "=" in param:
+            seen_default = True
+        elif seen_default:
+            out[i] = param + "=None"
     if saw_dots:
         out.extend(["*args", "**kwargs"])
     return ", ".join(out), setup
@@ -3646,8 +3855,161 @@ def raw_assignment(line: str) -> tuple[str, str] | None:
     return None
 
 
+def split_top_level_semicolons(text: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    quote = ""
+    start = 0
+    for i, ch in enumerate(text):
+        if quote:
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in {"'", '"'}:
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    parts.append(text[start:])
+    return parts
+
+
+def strip_return_call(stmt: str) -> str:
+    stmt = stmt.strip()
+    if re.match(r"^return\s*\(", stmt):
+        open_pos = stmt.find("(")
+        close_pos = find_matching_paren(stmt, open_pos)
+        if close_pos == len(stmt) - 1:
+            return stmt[open_pos + 1 : close_pos].strip()
+    return stmt
+
+
+def unwrap_braced_expression(text: str) -> str:
+    text = text.strip()
+    if text.startswith("{") and text.endswith("}"):
+        inner = text[1:-1].strip()
+        stmts = [part for part in split_top_level_semicolons(inner) if part.strip()]
+        if len(stmts) == 1:
+            return stmts[0].strip()
+    return text
+
+
+_LAMBDA_MASKS: dict[str, str] = {}
+
+
+def mask_lambda(text: str) -> str:
+    placeholder = f"__R_LAMBDA_{len(_LAMBDA_MASKS)}__"
+    _LAMBDA_MASKS[placeholder] = text
+    return placeholder
+
+
+def restore_lambda_masks(text: str) -> str:
+    # Inner lambdas can appear inside outer lambda bodies, so iterate.
+    while "__R_LAMBDA_" in text:
+        changed = False
+        for placeholder, value in _LAMBDA_MASKS.items():
+            if placeholder in text:
+                text = text.replace(placeholder, value)
+                changed = True
+        if not changed:
+            break
+    return text
+
+
+def translate_function_literal(expr: str) -> str | None:
+    if not re.match(r"^function\s*\(", expr):
+        return None
+    open_pos = expr.find("(")
+    close_pos = find_matching_paren(expr, open_pos)
+    if close_pos < 0:
+        return None
+    body = expr[close_pos + 1 :].strip()
+    if not body:
+        return None
+    params: list[str] = []
+    for raw_param in split_args(expr[open_pos + 1 : close_pos]):
+        raw_param = raw_param.strip()
+        if not raw_param:
+            continue
+        if raw_param == "...":
+            params.append("*_dots")
+            continue
+        pos = find_top_level_operator(raw_param, "=")
+        if pos >= 0:
+            params.append(f"{normalize_keyword_name(raw_param[:pos])}={translate_expr(raw_param[pos + 1:])}")
+        else:
+            params.append(r_name(raw_param))
+    body_expr = lambda_body_expression(body)
+    if body_expr is None:
+        return None
+    header = "lambda " + ", ".join(params) if params else "lambda"
+    candidate = f"({header}: {body_expr})"
+    try:
+        ast.parse(restore_lambda_masks(candidate), mode="eval")
+    except SyntaxError:
+        return None
+    return mask_lambda(candidate)
+
+
+def lambda_body_expression(body: str) -> str | None:
+    body = body.strip()
+    if body.startswith("{") and body.endswith("}"):
+        stmts = [part.strip() for part in split_top_level_semicolons(body[1:-1]) if part.strip()]
+        if not stmts:
+            return "None"
+        pieces: list[str] = []
+        for stmt in stmts[:-1]:
+            assign = raw_assignment(stmt)
+            if assign is None:
+                return None
+            lhs, rhs = assign
+            if not re.match(r"^[A-Za-z]\w*(?:\.\w+)*$", lhs):
+                return None
+            pieces.append(f"({r_name(lhs)} := {translate_expr(rhs)})")
+        pieces.append(translate_expr(strip_return_call(stmts[-1])))
+        if len(pieces) == 1:
+            return pieces[0]
+        return "(" + ", ".join(pieces) + ")[-1]"
+    return translate_expr(strip_return_call(body))
+
+
+def translate_if_else_expr(expr: str) -> str | None:
+    if not re.match(r"^if\s*\(", expr):
+        return None
+    open_pos = expr.find("(")
+    close_pos = find_matching_paren(expr, open_pos)
+    if close_pos < 0:
+        return None
+    cond = expr[open_pos + 1 : close_pos].strip()
+    rest = expr[close_pos + 1 :].strip()
+    split = split_top_level_else(rest)
+    if split is None:
+        return None
+    yes, no = split
+    if not yes or not no:
+        return None
+    yes = unwrap_braced_expression(strip_return_call(yes))
+    no = unwrap_braced_expression(strip_return_call(no))
+    candidate = f"({translate_expr(yes)} if {translate_expr(cond)} else {translate_expr(no)})"
+    try:
+        ast.parse(restore_lambda_masks(candidate), mode="eval")
+    except SyntaxError:
+        return None
+    return candidate
+
+
 def translate_expr(expr: str) -> str:
     expr = expr.strip().rstrip(";")
+    func_literal = translate_function_literal(expr)
+    if func_literal is not None:
+        return func_literal
+    if_else = translate_if_else_expr(expr)
+    if if_else is not None:
+        return if_else
     det_mod = translate_determinant_modulus_expr(expr)
     if det_mod is not None:
         return det_mod
@@ -3681,9 +4043,12 @@ def translate_determinant_modulus_expr(expr: str) -> str | None:
 def translate_expr_code(expr: str) -> str:
     expr = expr.replace("<-", "=")
     expr = re.sub(r"(?<=\d)[lL]\b", "", expr)
+    expr = replace_pipe_operator(expr, "|>")
+    expr = replace_pipe_operator(expr, "%>%")
     expr = replace_in_operator(expr)
     expr = replace_backtick_member_access(expr)
     expr = expr.replace("$", "@@MEM@@")
+    expr = expr.replace("%/%", "//")
     expr = expr.replace("%%", "%")
     expr = expr.replace("%*%", "@")
     expr = expr.replace("&&", " and ")
@@ -3714,6 +4079,31 @@ def replace_backtick_member_access(expr: str) -> str:
         lambda m: f"{r_name(m.group(1))}[{m.group(2)!r}]",
         expr,
     )
+
+
+def replace_pipe_operator(expr: str, op: str) -> str:
+    while True:
+        pos = find_top_level_operator(expr, op)
+        if pos < 0:
+            return expr
+        left = expr[:pos].strip()
+        right = expr[pos + len(op) :].strip()
+        if not left or not right:
+            return expr
+        call_match = re.match(r"^([A-Za-z_][\w.]*)\s*\(", right)
+        if call_match:
+            open_pos = right.find("(", call_match.end() - 1)
+            close_pos = find_matching_paren(right, open_pos)
+            if close_pos < 0:
+                return expr
+            inner = right[open_pos + 1 : close_pos].strip()
+            joined = left + (", " + inner if inner else "")
+            expr = right[:open_pos] + "(" + joined + ")" + right[close_pos + 1 :]
+            continue
+        if re.match(r"^[A-Za-z_][\w.]*$", right):
+            expr = f"{right}({left})"
+            continue
+        return expr
 
 
 def replace_in_operator(expr: str) -> str:
@@ -3809,10 +4199,15 @@ def replace_ranges(expr: str) -> str:
         start, stop = range_parts
         return f"r_seq({start}, {stop})"
     name_atom = r"[A-Za-z_]\w*(?:(?:@@MEM@@|\.)[A-Za-z_]\w*)*"
-    atom = rf"(?:{name_atom}\([^()]*\)|\([^()]+\)|{name_atom}(?!\s*\()|\d+(?:\.\d+)?)"
+    nested1 = r"(?:[^()]|\([^()]*\))*"
+    nested2 = rf"(?:[^()]|\({nested1}\))*"
+    atom = rf"(?:{name_atom}\({nested2}\)|\({nested2}\)|{name_atom}(?!\s*\()|\d+(?:\.\d+)?)"
     pattern = re.compile(rf"(?<![\w.=])({atom})\s*:\s*({atom})(?![\w.])")
 
     def repl(match: re.Match[str]) -> str:
+        # A colon directly after "lambda params" is Python syntax, not an R range.
+        if re.search(r"\blambda_?(?:\s+[\w, *=]*)?$", expr[: match.start()]):
+            return match.group(0)
         start, stop = match.groups()
         return f"r_seq({start}, {stop})"
 
@@ -4053,6 +4448,10 @@ def translate_member_expr(expr: str) -> str:
 
 def translate_subscript(index: str, *, base: str | None = None) -> str:
     index = strip_outer_parens(index)
+    # Statement-level callers pass raw R text; scrub R-only lexical forms that
+    # would otherwise leak into the generated subscript verbatim.
+    index = re.sub(r"\b(\d+)[Ll]\b", r"\1", index)
+    index = index.replace("%/%", "//").replace("%%", "%")
     if has_top_level_comma(index):
         return translate_matrix_subscript(index, base=base)
     if index == ":":
@@ -4464,6 +4863,9 @@ def translate_call(name: str, args: list[str]) -> str:
     for arg in args:
         if arg.strip() == "...":
             py_args.extend(["*args", "**kwargs"])
+        elif find_top_level_operator(arg, "~") >= 0 and find_top_level_operator(arg, "=") < 0:
+            # Keep unsupported formula arguments as strings so output stays valid Python.
+            py_args.append(repr(arg.strip()))
         else:
             py_args.append(translate_expr(arg))
     if name.startswith("np."):
@@ -4732,6 +5134,21 @@ def translate_call(name: str, args: list[str]) -> str:
         if len(args) >= 2:
             return f"isinstance({py_args[0]}, TryError)"
         return "False"
+    if lname == "strsplit":
+        parts = [translate_expr(arg) for arg in positional_args(args)[:2]]
+        fixed = translate_expr(keyword_arg(args, "fixed", default="FALSE"))
+        return f"r_strsplit({', '.join(parts)}, fixed={fixed})"
+    if lname == "kruskal.test":
+        formula = args[0]
+        pos = find_top_level_operator(formula, "~")
+        if pos >= 0:
+            return f"kruskal_test_py({translate_expr(formula[:pos])}, {translate_expr(formula[pos + 1:])})"
+        parts = [translate_expr(arg) for arg in positional_args(args)[:2]]
+        return "kruskal_test_py(" + ", ".join(parts) + ")"
+    if lname == "wilcox.test":
+        parts = [translate_expr(arg) for arg in positional_args(args)[:2]]
+        paired = translate_expr(keyword_arg(args, "paired", default="FALSE"))
+        return f"wilcox_test_py({', '.join(parts)}, paired={paired})"
     if lname == "quantile":
         return translate_quantile_call(args)
     if lname == "ecdf":
@@ -4746,7 +5163,7 @@ def translate_call(name: str, args: list[str]) -> str:
     if lname == "diff":
         return "r_diff(" + py_args[0] + ")"
     if lname == "format":
-        return "r_date_format(" + py_args[0] + ", " + py_args[1] + ")"
+        return translate_format_call(args)
     if lname == "cumsum":
         return "np.cumsum(" + py_args[0] + ")"
     if lname == "cumprod":
@@ -4855,9 +5272,9 @@ def translate_call(name: str, args: list[str]) -> str:
     if lname == "reduce":
         return "reduce_py(" + ", ".join(py_args) + ")"
     if lname == "numeric":
-        return "np.zeros(" + py_args[0] + ")"
+        return "np.zeros(" + (py_args[0] if py_args else "0") + ")"
     if lname == "integer":
-        return "np.zeros(" + py_args[0] + ", dtype=int)"
+        return "np.zeros(" + (py_args[0] if py_args else "0") + ", dtype=int)"
     if lname == "set.seed":
         return "np.random.seed(" + py_args[0] + ")"
     if lname == "sample.int":
@@ -4971,11 +5388,15 @@ def is_vector_expr(expr: str) -> bool:
 
 
 def translate_apply_call(args: list[str]) -> str:
-    if len(args) < 3:
+    positional = positional_args(args)
+    x_arg = keyword_arg(args, "X", default=positional[0] if positional else None)
+    margin_arg = keyword_arg(args, "MARGIN", default=positional[1] if len(positional) > 1 else None)
+    fun_arg = keyword_arg(args, "FUN", default=positional[2] if len(positional) > 2 else None)
+    if x_arg is None or margin_arg is None or fun_arg is None:
         raise R2PyError("apply requires array, margin, and function")
-    x = translate_expr(args[0])
-    margin = translate_expr(args[1])
-    func = translate_expr(args[2])
+    x = translate_expr(x_arg)
+    margin = translate_expr(margin_arg)
+    func = translate_expr(fun_arg)
     if func in {"sum", "np.sum"}:
         return f"r_apply({x}, {margin}, 'sum')"
     if func in {"mean", "np.mean"}:
@@ -5165,6 +5586,8 @@ def translate_model_matrix_call(args: list[str]) -> str:
     formula = args[0]
     pos = find_top_level_operator(formula, "~")
     if pos < 0:
+        if len(args) == 1:
+            return f"{translate_expr(args[0])}.design"
         raise R2PyError("model.matrix requires formula syntax")
     response = r_name(formula[:pos].strip())
     rhs = formula[pos + 1 :].strip()
@@ -5245,11 +5668,13 @@ def translate_integrate_call(args: list[str]) -> str:
 
 
 def translate_outer_call(args: list[str]) -> str:
-    if len(args) < 2:
+    positional = positional_args(args)
+    if len(positional) < 2:
         raise R2PyError("outer requires x and y")
-    x = translate_expr(args[0])
-    y = translate_expr(args[1])
-    func = translate_expr(args[2]) if len(args) > 2 else repr("*")
+    x = translate_expr(positional[0])
+    y = translate_expr(positional[1])
+    fun = keyword_arg(args, "FUN", default=positional[2] if len(positional) > 2 else None)
+    func = translate_expr(fun) if fun is not None else repr("*")
     return f"outer_py({x}, {y}, {func})"
 
 
@@ -5386,12 +5811,18 @@ def translate_tapply_call(args: list[str]) -> str:
 
 
 def translate_apply_list_call(name: str, args: list[str]) -> str:
-    if len(args) < 2:
+    positional = positional_args(args)
+    values_arg = keyword_arg(args, "X", default=positional[0] if positional else None)
+    fun = keyword_arg(args, "FUN", default=positional[1] if len(positional) > 1 else None)
+    if values_arg is None or fun is None:
         raise R2PyError(f"{name} requires list and function")
-    values = translate_expr(args[0])
-    func = args[1].strip()
-    py_func = repr(func) if func in {"sum", "mean", "length"} else translate_expr(func)
+    values = translate_expr(values_arg)
+    func = fun.strip()
     helper = "r_lapply" if name == "lapply" else "r_sapply"
+    if func in {"`[`", "`[[`", '"["', '"[["', "'['", "'[['"} and len(positional) > 2:
+        index = translate_expr(positional[2])
+        return f"{helper}({values}, (lambda _v: r_list_get(_v, {index})))"
+    py_func = repr(func) if func in {"sum", "mean", "length"} else translate_expr(func)
     return f"{helper}({values}, {py_func})"
 
 
@@ -5609,7 +6040,7 @@ def translate_quantile_call(args: list[str]) -> str:
     names_arg = keyword_arg(args, "names", default="True")
     if translate_expr(names_arg) == "False":
         return f"np.quantile({x}, {probs})"
-    return f"(lambda _p: RNamedVector(np.quantile({x}, _p), [f'{{100 * v:g}}%' for v in _p]))({probs})"
+    return f"(lambda _p: RNamedVector(np.quantile({x}, _p), [f'{{100 * v:g}}%' for v in _p]))(np.atleast_1d({probs}))"
 
 
 def translate_tail_call(args: list[str]) -> str:
@@ -5628,6 +6059,24 @@ def translate_head_call(args: list[str]) -> str:
     if n == "1" and re.match(r"^[A-Za-z_]\w*$", x) and x not in {"df", "data", "z", "values"}:
         return f"{x}[0]"
     return f"head_py({x}, {n})"
+
+
+def translate_format_call(args: list[str]) -> str:
+    if not args:
+        return '""'
+    positional = positional_args(args)
+    fmt = keyword_arg(args, "format")
+    if fmt is None and len(positional) >= 2 and positional[1].strip().startswith(('"', "'")):
+        fmt = positional[1]
+    if fmt is not None:
+        return f"r_date_format({translate_expr(positional[0])}, {translate_expr(fmt)})"
+    x = translate_expr(positional[0] if positional else args[0])
+    extras = []
+    for key in ["digits", "nsmall", "scientific", "width"]:
+        value = keyword_arg(args, key)
+        if value is not None:
+            extras.append(f"{key}={translate_expr(value)}")
+    return f"r_format_vec({x}" + (", " + ", ".join(extras) if extras else "") + ")"
 
 
 def translate_matrix_call(args: list[str]) -> str:
@@ -6011,6 +6460,8 @@ def apply_recycled_binops(expr: str) -> str:
 def r_name(name: str) -> str:
     if not name:
         return name
+    if "__R_STR_" in name or "__R_LAMBDA_" in name:
+        return name
     if len(name) >= 2 and name[0] == "`" and name[-1] == "`":
         name = name[1:-1]
     constants = {"True", "False", "None", "np", "pd", "stats", "r_stats", "nan", "inf", "and", "or", "not", "is", "in", "if", "else", "for"}
@@ -6051,7 +6502,7 @@ def split_args(text: str) -> list[str]:
                 quote = ""
             i += 1
             continue
-        if ch in {"'", '"'}:
+        if ch in {"'", '"', "`"}:
             quote = ch
         elif ch in "([{":
             depth += 1
