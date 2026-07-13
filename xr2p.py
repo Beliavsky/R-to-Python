@@ -2149,7 +2149,7 @@ def r_vec_subset(x, key):
         values = x
         names = None
     if isinstance(key, (bool, np.bool_)):
-        return values if key else values[:0]
+        return values if key else np.asarray(values).reshape(-1)[:0]
     arr = np.asarray(key)
     if np.asarray(values).ndim == 0:
         idx = int(arr) if arr.ndim == 0 else int(np.asarray(arr).ravel()[0])
