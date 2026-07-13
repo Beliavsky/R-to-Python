@@ -820,7 +820,12 @@ def source_py(path):
         namespace = runpy.run_path(py_path, init_globals=init_namespace)
         for scope_globals in scopes:
             for key, value in namespace.items():
-                if not key.startswith("__"):
+                # A sourced translation can contain an older generated runtime
+                # helper. Keep the caller's current implementation rather than
+                # allowing that cached helper to replace it.
+                if not key.startswith("__") and not (
+                    key == "try_catch_py" and key in before_namespace
+                ):
                     scope_globals[key] = value
         new_keys = [
             key
@@ -854,8 +859,8 @@ def source_py(path):
                     value.__globals__.update(main_vars)
         except Exception:
             pass
-    except FileNotFoundError:
-        return None
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"translated source dependency not found: {py_path}") from exc
     return None
 """.strip()
         )
@@ -1364,6 +1369,8 @@ def r_paste(*values, sep=" ", collapse=None):
         helpers.append(
             """
 def r_list_get(x, idx):
+    if "RNamedVector" in globals() and isinstance(idx, RNamedVector):
+        idx = np.asarray(idx.values).ravel()[0]
     if not isinstance(idx, str):
         idx_arr = np.asarray(idx)
         if idx_arr.dtype.kind in {"U", "S", "O"}:
@@ -2100,9 +2107,12 @@ def proc_time():
         helpers.append(
             """
 def r_split(x, group):
-    values = np.asarray(x)
     groups = np.asarray(group.values if "RFactor" in globals() and isinstance(group, RFactor) else group)
     levels = group.levels if "RFactor" in globals() and isinstance(group, RFactor) else sorted(dict.fromkeys(groups).keys())
+    if "pd" in globals() and isinstance(x, pd.DataFrame):
+        pieces = {str(level): x.loc[groups == level].reset_index(drop=True) for level in levels}
+        return RList(**pieces, _r_names=[str(level) for level in levels])
+    values = np.asarray(x)
     return RList(**{str(level): values[groups == level] for level in levels}, _r_names=[str(level) for level in levels])
 
 
@@ -2324,7 +2334,10 @@ def r_subset(x, *keys):
         if bool_rows:
             return x.loc[row_key, :].reset_index(drop=True)
         if int_rows:
-            return x.iloc[np.asarray(row_key), :].reset_index(drop=True)
+            # R keeps a one-row data.frame for df[i, ]; do not drop to a Series.
+            return x.iloc[np.atleast_1d(np.asarray(row_key)), :].reset_index(drop=True)
+        if isinstance(row_key, (int, np.integer)) and isinstance(col_key, slice) and col_key == slice(None):
+            return x.iloc[[int(row_key)], :].reset_index(drop=True)
         return _positional(x.iloc[row_key, col_key], not full_rows)
     if isinstance(x, pd.Series):
         if len(keys) == 2 and isinstance(keys[1], slice):
@@ -2369,7 +2382,14 @@ def r_set_subset(x, value, *keys):
                 if row_arr.ndim == 0 and col_arr.ndim == 0:
                     x[int(row_arr), int(col_arr)] = value
                 else:
-                    x[np.ix_(np.atleast_1d(row_arr), np.atleast_1d(col_arr))] = value
+                    rows1 = np.atleast_1d(row_arr)
+                    cols1 = np.atleast_1d(col_arr)
+                    vals = np.asarray(value)
+                    if vals.shape != (rows1.size, cols1.size):
+                        flat = vals.ravel(order="F") if vals.ndim == 2 else np.ravel(vals)
+                        # R fills the target block column-major with recycling.
+                        vals = np.resize(flat, (cols1.size, rows1.size)).T
+                    x[np.ix_(rows1, cols1)] = vals
                 return x
         x[keys] = value
         return x
@@ -2657,6 +2677,12 @@ class RList(SimpleNamespace):
         object.__setattr__(self, name, value)
         if not name.startswith("_") and name not in self._r_names:
             self._r_names.append(name)
+
+    def __getattr__(self, name):
+        # R returns NULL for missing list elements.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return None
 
     def __getitem__(self, key):
         if isinstance(key, str):
@@ -3572,7 +3598,9 @@ def cbind_py(*cols, **named_cols):
     return np.column_stack(out)
 
 
-def rbind_py(*rows):
+def rbind_py(*rows, **named_rows):
+    if named_rows:
+        rows = list(rows) + list(named_rows.values())
     if any(isinstance(row, pd.DataFrame) for row in rows):
         return pd.concat(rows, axis=0, ignore_index=True)
     if rows and all("RNamedVector" in globals() and isinstance(row, RNamedVector) for row in rows):
@@ -6394,6 +6422,8 @@ def translate_call(name: str, args: list[str]) -> str:
         return translate_apply_list_call("sapply", positional_args(args)[:2])
     if lname == "drop":
         return f"np.squeeze(np.asarray({translate_expr(args[0])}))"
+    if lname == "rev":
+        return f"np.flip({translate_expr(positional_args(args)[0])})"
     if lname == "unlist":
         return f"r_unlist({translate_expr(positional_args(args)[0])})"
     if lname == "as.list":
@@ -8613,6 +8643,110 @@ def count_code_lines(source: str) -> int:
     return sum(1 for line in source.splitlines() if line.strip() and not line.lstrip().startswith("#"))
 
 
+def source_scan_text(source: str) -> str:
+    """Remove R comments while preserving quoted strings for source() scanning."""
+    lines: list[str] = []
+    for line in source.splitlines():
+        kept: list[str] = []
+        quote: str | None = None
+        escaped = False
+        for char in line:
+            if escaped:
+                kept.append(char)
+                escaped = False
+            elif char == "\\" and quote is not None:
+                kept.append(char)
+                escaped = True
+            elif quote is not None:
+                kept.append(char)
+                if char == quote:
+                    quote = None
+            elif char in {'"', "'"}:
+                quote = char
+                kept.append(char)
+            elif char == "#":
+                break
+            else:
+                kept.append(char)
+        lines.append("".join(kept))
+    return "\n".join(lines)
+
+
+def literal_source_paths(source: str) -> list[str]:
+    """Return literal file arguments from source("file.r") calls."""
+    pattern = re.compile(r"\bsource\s*\(\s*([\"'])(.*?)\1", re.IGNORECASE | re.DOTALL)
+    paths: list[str] = []
+    for match in pattern.finditer(source_scan_text(source)):
+        literal = match.group(1) + match.group(2) + match.group(1)
+        try:
+            value = ast.literal_eval(literal)
+        except (SyntaxError, ValueError):
+            value = match.group(2)
+        if isinstance(value, str):
+            paths.append(value)
+    return paths
+
+
+def translate_source_dependencies(
+    source: str,
+    source_path: Path,
+    output_path: Path,
+    *,
+    use_numba: bool,
+    banner: bool,
+    lean: bool,
+) -> list[Path]:
+    """Recursively translate local files referenced by literal source() calls."""
+    written: list[Path] = []
+    visited: set[tuple[Path, Path]] = {(source_path.resolve(), output_path.resolve())}
+
+    def translate_dependency(r_path: Path, py_path: Path) -> None:
+        key = (r_path.resolve(), py_path.resolve())
+        if key in visited:
+            return
+        visited.add(key)
+        try:
+            dependency_source = r_path.read_text(encoding="utf-8-sig")
+        except OSError as exc:
+            raise R2PyError(f"cannot read source dependency {r_path}: {exc}") from exc
+        dependency_python = translate_source(
+            dependency_source,
+            use_numba=use_numba,
+            source_name=str(r_path),
+            banner=banner,
+        )
+        if lean:
+            slimmed = slim_python(dependency_python)
+            if slimmed != dependency_python and compile_python_text(slimmed).returncode == 0:
+                dependency_python = slimmed
+        for child in literal_source_paths(dependency_source):
+            child_r = Path(child)
+            child_py = Path(child)
+            if child_r.is_absolute():
+                child_py = child_r
+            else:
+                child_r = r_path.parent / child_r
+                child_py = py_path.parent / child_py
+            if child_r.suffix.lower() == ".r":
+                translate_dependency(child_r, child_py.with_suffix(".py"))
+        py_path.parent.mkdir(parents=True, exist_ok=True)
+        py_path.write_text(dependency_python, encoding="utf-8")
+        written.append(py_path)
+        print(f"wrote dependency {py_path}")
+
+    for dependency in literal_source_paths(source):
+        dependency_r = Path(dependency)
+        dependency_py = Path(dependency)
+        if dependency_r.is_absolute():
+            dependency_py = dependency_r
+        else:
+            dependency_r = source_path.parent / dependency_r
+            dependency_py = output_path.parent / dependency_py
+        if dependency_r.suffix.lower() == ".r":
+            translate_dependency(dependency_r, dependency_py.with_suffix(".py"))
+    return written
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Translate a numerical subset of R to Python/NumPy.")
     parser.add_argument("source", type=Path, help="R source file")
@@ -8727,6 +8861,18 @@ def main(argv: list[str] | None = None) -> int:
                 print("warning: --lean output failed syntax check; wrote unslimmed translation", file=sys.stderr)
 
     out = args.out or args.source.with_suffix(".py")
+    try:
+        dependency_outputs = translate_source_dependencies(
+            source,
+            args.source,
+            out,
+            use_numba=not args.no_numba,
+            banner=not args.no_banner,
+            lean=args.lean,
+        )
+    except (OSError, R2PyError) as exc:
+        print(f"xr2p: {exc}", file=sys.stderr)
+        return 1
     runtime_python = ""
     runtime_path: Path | None = None
     runtime_written = False
@@ -8776,11 +8922,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.tee:
         print(python, end="" if python.endswith("\n") else "\n")
     if not args.no_py_compile:
-        compile_result = check_python_compile(out)
-        if compile_result.returncode != 0:
-            print("Python syntax check failed:", file=sys.stderr)
-            print_process_output(compile_result)
-            return compile_result.returncode
+        for compile_path in [*dependency_outputs, out]:
+            compile_result = check_python_compile(compile_path)
+            if compile_result.returncode != 0:
+                print(f"Python syntax check failed ({compile_path}):", file=sys.stderr)
+                print_process_output(compile_result)
+                return compile_result.returncode
 
     python_round_digits = args.round_both if args.round_both is not None else args.round
     r_round_digits = args.round_both
