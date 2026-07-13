@@ -4011,6 +4011,8 @@ def repair_generated_syntax_cleanup(python: str) -> str:
 def translate_statement(line: str) -> list[str]:
     line = rewrite_replicate_calls(line)
     lifted, line = lift_multistatement_function_literals(line)
+    lifted_blocks, line = lift_braced_call_arguments(line)
+    lifted.extend(lifted_blocks)
     result = translate_statement_inner(line)
     return lifted + result if lifted else result
 
@@ -4144,6 +4146,51 @@ def lift_multistatement_function_literals(line: str) -> tuple[list[str], str]:
         defs.extend(translate_function_body_lines(masked[after : brace_close + 1]))
         masked = masked[:start] + name + masked[brace_close + 1 :]
         search = start + len(name)
+    if not defs:
+        return [], line
+    return (
+        [restore_string_literals(item, strings) for item in defs],
+        restore_string_literals(masked, strings),
+    )
+
+
+def lift_braced_call_arguments(line: str) -> tuple[list[str], str]:
+    """Lift ``f({ statements; value })`` blocks into nested functions."""
+    global _LIFTED_FN_COUNTER
+    if "{" not in line:
+        return [], line
+    masked, strings = mask_string_literals(line)
+    defs: list[str] = []
+    search = 0
+    while search < len(masked):
+        brace_pos = masked.find("{", search)
+        if brace_pos < 0:
+            break
+        paren_depth = 0
+        for char in masked[:brace_pos]:
+            if char == "(":
+                paren_depth += 1
+            elif char == ")":
+                paren_depth = max(paren_depth - 1, 0)
+        previous = brace_pos - 1
+        while previous >= 0 and masked[previous].isspace():
+            previous -= 1
+        # Control-flow and function-definition braces are handled elsewhere.
+        # A braced call argument follows an opening paren, comma, or named-arg
+        # equals sign while still nested inside the call's parentheses.
+        if paren_depth == 0 or previous < 0 or masked[previous] not in "(,=":
+            search = brace_pos + 1
+            continue
+        brace_close = find_matching_char(masked, brace_pos, "{", "}")
+        if brace_close < 0:
+            break
+        _LIFTED_FN_COUNTER += 1
+        name = f"_r_block_{_LIFTED_FN_COUNTER}"
+        defs.append(f"def {name}():")
+        defs.extend(translate_function_body_lines(masked[brace_pos : brace_close + 1]))
+        replacement = f"{name}()"
+        masked = masked[:brace_pos] + replacement + masked[brace_close + 1 :]
+        search = brace_pos + len(replacement)
     if not defs:
         return [], line
     return (
@@ -6566,6 +6613,8 @@ def translate_call(name: str, args: list[str]) -> str:
         return "time.ctime()"
     if lname == "source":
         return "source_py(" + py_args[0] + ")"
+    if lname == "force":
+        return py_args[0]
     if lname == "length":
         return "r_length(" + py_args[0] + ")"
     if lname == "names":
