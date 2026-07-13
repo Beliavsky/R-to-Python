@@ -6161,9 +6161,9 @@ def translate_call(name: str, args: list[str]) -> str:
         return translate_within_call(args)
     if lname == "try":
         if not args:
-            return "try_(lambda: None)"
+            return mask_lambda("try_(lambda: None)")
         silent = translate_expr(keyword_arg(args, "silent", default="False"))
-        return f"try_(lambda: {translate_expr(positional_args(args)[0])}, silent={silent})"
+        return mask_lambda(f"try_(lambda: {translate_expr(positional_args(args)[0])}, silent={silent})")
     if lname == "trycatch":
         return translate_trycatch_call(args)
     if lname == "subset":
@@ -6456,6 +6456,13 @@ def translate_call(name: str, args: list[str]) -> str:
         return "svd_py(" + py_args[0] + ")"
     if lname == "qr":
         return "qr_py(" + py_args[0] + ")"
+    if lname == "qr.solve":
+        positional = positional_args(args)
+        if len(positional) < 2:
+            raise R2PyError("qr.solve requires a matrix and right hand side")
+        tol = keyword_arg(args, "tol")
+        rcond = "None" if tol is None else translate_expr(tol)
+        return f"np.linalg.lstsq({translate_expr(positional[0])}, {translate_expr(positional[1])}, rcond={rcond})[0]"
     if lname == "determinant":
         logarithm = translate_expr(keyword_arg(args, "logarithm", default="True"))
         return "determinant_py(" + py_args[0] + ", logarithm=" + logarithm + ")"
