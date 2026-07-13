@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -69,9 +70,9 @@ def translate_source(source: str, *, use_numba: bool = True, source_name: str | 
     python = add_blank_lines_after_functions(python)
     python = add_pass_to_empty_blocks(python)
     python = repair_generated_syntax_cleanup(python)
-    if "stats." in python or "aov_py(" in python or "kruskal_test_py(" in python or "wilcox_test_py(" in python:
+    if re.search(r"(?<![\w.])stats\.", python) or "aov_py(" in python or "kruskal_test_py(" in python or "wilcox_test_py(" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom scipy import stats as r_stats\n", 1)
-        python = python.replace("stats.", "r_stats.")
+        python = re.sub(r"(?<![\w.])stats\.", "r_stats.", python)
     if "optimize." in python or "uniroot_py(" in python or re.search(r"(?<![\w.])fsolve(?![\w.])", python):
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom scipy import optimize\n", 1)
     if "integrate." in python or "integrate_py(" in python:
@@ -8300,14 +8301,14 @@ def unquote_r_string_tokens(line: str) -> str:
 
 
 def check_python_compile(path: Path) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        [sys.executable, "-m", "py_compile", str(path)],
-        text=True,
-        capture_output=True,
-    )
-    if result.returncode == 0:
-        remove_py_compile_artifacts(path)
-    return result
+    command = [sys.executable, "-m", "py_compile", str(path)]
+    try:
+        source = path.read_text(encoding="utf-8")
+        compile(source, str(path), "exec")
+    except (OSError, SyntaxError) as exc:
+        stderr = "".join(traceback.format_exception_only(type(exc), exc))
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr=stderr)
+    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
 
 def remove_py_compile_artifacts(path: Path) -> None:
