@@ -1833,8 +1833,9 @@ def r_lapply(x, func):
 def r_sapply(x, func):
     names, values = r_list_items(x)
     out = np.array([r_apply_func(value, func) for value in values])
-    if out.ndim == 2:
-        return out.T
+    if out.ndim >= 2:
+        # R's sapply/replicate simplification stacks results along the last axis.
+        return np.moveaxis(out, 0, -1)
     use_names = isinstance(x, RList)
     if not use_names:
         try:
@@ -3153,6 +3154,8 @@ nagarch_negloglik_fast = _nagarch_negloglik_fast_impl
         helpers.append(
             """
 def r_format(x, digits=None):
+    if isinstance(x, (bool, np.bool_)):
+        return "TRUE" if x else "FALSE"
     if isinstance(x, (np.integer, int)):
         return str(int(x))
     if isinstance(x, (np.floating, float)):
@@ -3952,9 +3955,39 @@ def repair_generated_syntax_cleanup(python: str) -> str:
 
 
 def translate_statement(line: str) -> list[str]:
+    line = rewrite_replicate_calls(line)
     lifted, line = lift_multistatement_function_literals(line)
     result = translate_statement_inner(line)
     return lifted + result if lifted else result
+
+
+def rewrite_replicate_calls(line: str) -> str:
+    """Rewrite replicate(n, expr) as sapply/lapply over an anonymous function."""
+    if "replicate" not in line:
+        return line
+    masked, strings = mask_string_literals(line)
+    out = masked
+    while True:
+        match = re.search(r"(?<![\w.])replicate\s*\(", out)
+        if match is None:
+            break
+        open_pos = out.find("(", match.start())
+        close_pos = find_matching_paren(out, open_pos)
+        if close_pos < 0:
+            break
+        args = split_args(out[open_pos + 1 : close_pos])
+        positional = positional_args(args)
+        if len(positional) < 2:
+            break
+        n_arg = keyword_arg(args, "n", default=positional[0])
+        body = keyword_arg(args, "expr", default=positional[1]).strip()
+        simplify = (keyword_arg(args, "simplify", default="TRUE") or "").strip().upper()
+        if not body.startswith("{"):
+            body = "{ " + body + " }"
+        mapper = "lapply" if simplify in {"FALSE", "F"} else "sapply"
+        replacement = f"{mapper}(seq_len({n_arg}), function(_r_rep_i_) {body})"
+        out = out[: match.start()] + replacement + out[close_pos + 1 :]
+    return restore_string_literals(out, strings)
 
 
 _LIFTED_FN_COUNTER = 0
