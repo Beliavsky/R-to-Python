@@ -997,6 +997,8 @@ def r_as_matrix(x):
         helpers.append(
             """
 def t_py(x):
+    if "pd" in globals() and isinstance(x, pd.DataFrame):
+        return x.T
     if hasattr(x, "values") and hasattr(x, "names"):
         return x
     values = x
@@ -1843,7 +1845,15 @@ def r_lapply(x, func):
 
 def r_sapply(x, func):
     names, values = r_list_items(x)
-    out = np.array([r_apply_func(value, func) for value in values])
+    results = [r_apply_func(value, func) for value in values]
+    if results and "RNamedVector" in globals() and all(isinstance(result, RNamedVector) for result in results):
+        result_names = results[0].names
+        if all(result.names == result_names for result in results):
+            matrix = np.column_stack([result.values for result in results])
+            if "pd" in globals():
+                return pd.DataFrame(matrix, index=result_names)
+            return matrix
+    out = np.array(results)
     if out.ndim >= 2:
         # R's sapply/replicate simplification stacks results along the last axis.
         return np.moveaxis(out, 0, -1)
@@ -3244,18 +3254,7 @@ def r_print(*args, digits=None, colnames=None, row_names=True):
         print(frame.to_string(index=bool(row_names), na_rep="NA"))
     elif "pd" in globals() and isinstance(x, pd.Series):
         values = [r_format(v, digits) for v in x.to_numpy()]
-        if x.index.dtype == bool:
-            labels = [str(v) for v in x.index.tolist()]
-        else:
-            labels = [str(v) for v in x.index]
-        if colnames is not None:
-            labels = [str(label) for label in colnames]
-        if len(labels) == len(values):
-            widths = [max(len(label), len(value)) for label, value in zip(labels, values)]
-            print(" ".join(labels[j].rjust(widths[j]) for j in range(len(labels))))
-            print(" ".join(values[j].rjust(widths[j]) for j in range(len(values))))
-        else:
-            print(" ".join(values))
+        print(" ".join(values))
     elif "RNamedVector" in globals() and isinstance(x, RNamedVector):
         labels = [str(label) for label in x.names]
         values = [r_format(v, digits) for v in x.values]
