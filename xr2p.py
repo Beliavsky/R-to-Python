@@ -6319,6 +6319,10 @@ def translate_call(name: str, args: list[str]) -> str:
         return f"np.{lname}(" + ", ".join(py_args) + ")"
     if lname == "gamma":
         return "special.gamma(" + ", ".join(py_args) + ")"
+    if lname == "choose":
+        if len(py_args) < 2:
+            raise R2PyError("choose requires n and k")
+        return f"special.comb({py_args[0]}, {py_args[1]}, exact=False)"
     if lname == "besselk":
         if len(args) < 2:
             raise R2PyError("besselK requires x and nu")
