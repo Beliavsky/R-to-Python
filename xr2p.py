@@ -4212,6 +4212,13 @@ def translate_statement_inner(line: str) -> list[str]:
     parsed_for = parse_for_line(line)
     if parsed_for is not None:
         name, values, rest = parsed_for
+        CHARACTER_VECTOR_VARS.discard(name)
+        LOGICAL_VECTOR_VARS.discard(name)
+        iterable_name = r_name(strip_outer_parens(values.strip()))
+        if iterable_name in CHARACTER_VECTOR_VARS or is_character_vector_expr(values):
+            CHARACTER_VECTOR_VARS.add(name)
+        elif iterable_name in LOGICAL_VECTOR_VARS:
+            LOGICAL_VECTOR_VARS.add(name)
         if rest:
             return [f"for {name} in {translate_for_iter(values)}:", *[INDENT + part for part in translate_statement(rest)]]
         return [f"for {name} in {translate_for_iter(values)}:"]
@@ -5622,6 +5629,8 @@ def translate_matrix_subscript(index: str, *, base: str | None = None) -> str:
             out.append(f"r_row_key({base}, {item}, globals().get('{base}_rownames'))")
         elif axis == 1 and base and (is_string_literal(item) or re.fullmatch(r"__R_STR_\d+__", item)):
             out.append(f"r_col_key({base}, {item}, globals().get('{base}_colnames'))")
+        elif axis == 1 and base and re.fullmatch(r"[A-Za-z_][\w.]*", item) and r_name(item) in CHARACTER_VECTOR_VARS:
+            out.append(f"r_col_key({base}, {translate_expr(item)}, globals().get('{base}_colnames'))")
         elif axis == 1 and base and is_string_index_expr(item) and not is_likely_dataframe_name(base):
             cols = translate_expr(item)
             out.append(f"np.array([r_col_key({base}, _col, globals().get('{base}_colnames')) for _col in np.ravel({cols})])")
