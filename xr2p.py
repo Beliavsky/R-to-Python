@@ -78,6 +78,8 @@ def translate_source(source: str, *, use_numba: bool = True, source_name: str | 
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom scipy import integrate\n", 1)
     if "linalg." in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom scipy import linalg\n", 1)
+    if "special." in python:
+        python = python.replace("import numpy as np\n", "import numpy as np\nfrom scipy import special\n", 1)
     if "arima_py(" in python or "arima_sim_py(" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nfrom statsmodels.tsa.arima.model import ARIMA as SMARIMA\nfrom statsmodels.tsa.arima_process import ArmaProcess\n", 1)
     if "glm_py(" in python:
@@ -4903,6 +4905,26 @@ def translate_if_else_expr(expr: str) -> str | None:
     return candidate
 
 
+def replace_parenthesized_if_else_exprs(expr: str) -> str:
+    """Translate R inline ``if`` expressions nested inside larger expressions."""
+    while True:
+        changed = False
+        for match in reversed(list(re.finditer(r"\(\s*if\s*\(", expr))):
+            open_pos = match.start()
+            close_pos = find_matching_char(expr, open_pos, "(", ")")
+            if close_pos < 0:
+                continue
+            inner = expr[open_pos + 1 : close_pos].strip()
+            translated = translate_if_else_expr(inner)
+            if translated is None:
+                continue
+            expr = expr[:open_pos] + translated + expr[close_pos + 1 :]
+            changed = True
+            break
+        if not changed:
+            return expr
+
+
 def translate_expr(expr: str) -> str:
     expr = expr.strip().rstrip(";")
     backtick_op = re.fullmatch(r"`([^`\w]+)`", expr)
@@ -4914,6 +4936,7 @@ def translate_expr(expr: str) -> str:
     if_else = translate_if_else_expr(expr)
     if if_else is not None:
         return if_else
+    expr = replace_parenthesized_if_else_exprs(expr)
     det_mod = translate_determinant_modulus_expr(expr)
     if det_mod is not None:
         return det_mod
@@ -5271,7 +5294,7 @@ def replace_innermost_call(expr: str) -> str:
     pattern = re.compile(r"(?<![\w.])([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)\s*\(")
     for match in pattern.finditer(expr):
         name = match.group(1)
-        if name.startswith(("np.", "stats.", "r_stats.", "pd.")) or name in {"SimpleNamespace", "RList", "RNamedVector", "RFactor", "RTimeSeries", "r_print", "r_s3_print", "r_s3_dispatch", "r_add", "r_sub", "r_mul", "r_div", "r_seq", "r_range", "r_subset", "r_set_subset", "r_subset_df", "r_with", "r_within", "r_col_key", "r_row_key", "r_attr", "r_set_attr", "r_attributes", "r_eval", "r_parse", "r_paste", "r_substr", "r_list_get", "r_factor", "r_levels", "r_factor_int", "r_table", "r_tapply", "cut_py", "r_lapply", "r_sapply", "r_mapply", "outer_py", "r_split", "r_unsplit", "r_as_date", "r_date_add", "r_date_format", "r_date_seq", "r_diff", "r_ts", "r_start", "r_end", "r_frequency", "r_window", "r_lag", "arima_py", "arima_sim_py", "kmeans_py", "stack_py", "unstack_py", "prcomp_py", "aov_py", "glm_py", "r_list_from_dots", "do_call_py", "capture_output_py", "rle_py", "inverse_rle_py", "r_df_col", "r_data_frame", "r_model_matrix", "r_matrix_data", "cbind_py", "rbind_py", "acf_py", "uniroot_py", "integrate_py", "try_catch_py", "eigen_py", "svd_py", "qr_py", "summary_py", "ecdf_py", "getattr", "globals", "int", "float", "str", "len"}:
+        if name.startswith(("np.", "stats.", "r_stats.", "pd.", "special.")) or name in {"SimpleNamespace", "RList", "RNamedVector", "RFactor", "RTimeSeries", "r_print", "r_s3_print", "r_s3_dispatch", "r_add", "r_sub", "r_mul", "r_div", "r_seq", "r_range", "r_subset", "r_set_subset", "r_subset_df", "r_with", "r_within", "r_col_key", "r_row_key", "r_attr", "r_set_attr", "r_attributes", "r_eval", "r_parse", "r_paste", "r_substr", "r_list_get", "r_factor", "r_levels", "r_factor_int", "r_table", "r_tapply", "cut_py", "r_lapply", "r_sapply", "r_mapply", "outer_py", "r_split", "r_unsplit", "r_as_date", "r_date_add", "r_date_format", "r_date_seq", "r_diff", "r_ts", "r_start", "r_end", "r_frequency", "r_window", "r_lag", "arima_py", "arima_sim_py", "kmeans_py", "stack_py", "unstack_py", "prcomp_py", "aov_py", "glm_py", "r_list_from_dots", "do_call_py", "capture_output_py", "rle_py", "inverse_rle_py", "r_df_col", "r_data_frame", "r_model_matrix", "r_matrix_data", "cbind_py", "rbind_py", "acf_py", "uniroot_py", "integrate_py", "try_catch_py", "eigen_py", "svd_py", "qr_py", "summary_py", "ecdf_py", "getattr", "globals", "int", "float", "str", "len"}:
             continue
         open_pos = expr.find("(", match.start())
         close_pos = find_matching_paren(expr, open_pos)
@@ -5978,7 +6001,7 @@ def translate_call(name: str, args: list[str]) -> str:
             py_args.append(repr(arg.strip()))
         else:
             py_args.append(translate_expr(arg))
-    if name.startswith("np."):
+    if name.startswith(("np.", "special.")):
         return name + "(" + ", ".join(py_args) + ")"
     if call_name in USER_FUNCTION_PARAMS and call_name != name:
         return call_name + "(" + ", ".join(py_args) + ")"
@@ -6094,8 +6117,24 @@ def translate_call(name: str, args: list[str]) -> str:
         return f"np.angle({py_args[0]})"
     if lname == "conj":
         return f"np.conj({py_args[0]})"
-    if lname in {"log", "log10", "exp", "sin", "cos", "tan", "abs", "floor"}:
+    if lname in {"log", "log10", "exp", "sin", "cos", "tan", "sinh", "cosh", "tanh", "abs", "floor"}:
         return f"np.{lname}(" + ", ".join(py_args) + ")"
+    if lname == "gamma":
+        return "special.gamma(" + ", ".join(py_args) + ")"
+    if lname == "besselk":
+        if len(args) < 2:
+            raise R2PyError("besselK requires x and nu")
+        x = translate_expr(args[0])
+        nu = translate_expr(args[1])
+        scaled_arg = keyword_arg(args, "expon.scaled")
+        if scaled_arg is None:
+            scaled_arg = keyword_arg(args, "expon_scaled", default="False")
+        scaled = translate_expr(scaled_arg)
+        if scaled == "True":
+            return f"special.kve({nu}, {x})"
+        if scaled == "False":
+            return f"special.kv({nu}, {x})"
+        return f"np.where({scaled}, special.kve({nu}, {x}), special.kv({nu}, {x}))"
     if lname == "linspace":
         return "np.linspace(" + ", ".join(py_args) + ")"
     if lname == "ceiling":
@@ -7739,7 +7778,7 @@ def r_name(name: str) -> str:
     constants = {"True", "False", "None", "np", "pd", "stats", "r_stats", "nan", "inf", "and", "or", "not", "is", "in", "if", "else", "for"}
     if "@@MEM@@" in name:
         return ".".join(r_name(part) for part in name.split("@@MEM@@"))
-    if name in constants or name.startswith(("np.", "stats.", "r_stats.", "pd.", "time.", "os.", "math.", "sys.")):
+    if name in constants or name.startswith(("np.", "stats.", "r_stats.", "pd.", "special.", "time.", "os.", "math.", "sys.")):
         return name
     if name[0].isdigit():
         return name
@@ -7756,7 +7795,7 @@ def r_name(name: str) -> str:
 
 
 def r_function_name(name: str) -> str:
-    if name.startswith(("np.", "stats.", "r_stats.", "pd.", "time.", "linalg.", "os.", "math.", "sys.")):
+    if name.startswith(("np.", "stats.", "r_stats.", "pd.", "special.", "time.", "linalg.", "os.", "math.", "sys.")):
         return name
     return r_name(name.replace(".", "_"))
 
