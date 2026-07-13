@@ -5602,7 +5602,7 @@ def translate_matrix_subscript(index: str, *, base: str | None = None) -> str:
             cols = translate_expr(item)
             out.append(f"np.array([r_col_key({base}, _col, globals().get('{base}_colnames')) for _col in np.ravel({cols})])")
         elif is_logical_subscript(item):
-            out.append(item)
+            out.append(translate_logical_matrix_subscript(item))
             advanced_axes.append(len(out) - 1)
         elif re.fullmatch(r"[A-Za-z]\w*", item) and r_name(item) not in LOGICAL_VECTOR_VARS:
             # Selectors held in variables can be numeric, logical, or
@@ -5621,6 +5621,27 @@ def translate_matrix_subscript(index: str, *, base: str | None = None) -> str:
             return ", ".join(out)
         return f"np.ix_({out[0]}, {out[1]})"
     return ", ".join(out)
+
+
+def translate_logical_matrix_subscript(item: str) -> str:
+    """Translate a logical axis while preserving nested matrix selections."""
+    replacements: list[tuple[str, str]] = []
+    pattern = re.compile(r"\b([A-Za-z]\w*)\s*\[([^\[\]]*)\]")
+
+    def mask_nested(match: re.Match[str]) -> str:
+        base, index = match.groups()
+        if not has_top_level_comma(index):
+            return match.group(0)
+        placeholder = f"__R_MATRIX_SUB_{len(replacements)}__"
+        replacement = f"r_subset({r_name(base)}, {translate_subscript(index, base=r_name(base))})"
+        replacements.append((placeholder, replacement))
+        return placeholder
+
+    masked = pattern.sub(mask_nested, item)
+    translated = translate_expr(masked)
+    for placeholder, replacement in replacements:
+        translated = translated.replace(placeholder, replacement)
+    return translated
 
 
 def translate_matrix_axis_subscript(item: str) -> str:
