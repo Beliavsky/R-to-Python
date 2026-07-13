@@ -110,6 +110,8 @@ def translate_source(source: str, *, use_numba: bool = True, source_name: str | 
         python = python.replace("import numpy as np\n", "import numpy as np\nimport pandas as pd\n", 1)
     if "tempfile." in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nimport tempfile\n", 1)
+    if "itertools." in python:
+        python = python.replace("import numpy as np\n", "import numpy as np\nimport itertools\n", 1)
     if "source_py(" in python:
         python = python.replace("import numpy as np\n", "import numpy as np\nimport runpy\n", 1)
     if "pickle." in python:
@@ -1891,6 +1893,27 @@ def r_filter(func, values):
     if isinstance(values, np.ndarray):
         return np.asarray(kept)
     return kept
+""".strip()
+        )
+    if "combn_py(" in python:
+        helpers.append(
+            """
+def combn_py(x, m, func=None, simplify=True):
+    values = np.asarray(x)
+    flat = values.ravel()
+    m = int(m)
+    if m < 0 or m > flat.size:
+        raise ValueError("combn requires 0 <= m <= length(x)")
+    combinations = [np.asarray(items, dtype=values.dtype) for items in itertools.combinations(flat.tolist(), m)]
+    if func is not None:
+        combinations = [func(items) for items in combinations]
+    if not simplify:
+        return combinations
+    if func is not None:
+        return np.asarray(combinations)
+    if not combinations:
+        return np.empty((m, 0), dtype=values.dtype)
+    return np.column_stack(combinations)
 """.strip()
         )
     if "r_mapply(" in python:
@@ -6342,6 +6365,14 @@ def translate_call(name: str, args: list[str]) -> str:
         if len(py_args) < 2:
             raise R2PyError("choose requires n and k")
         return f"special.comb({py_args[0]}, {py_args[1]}, exact=False)"
+    if lname == "combn":
+        positional = positional_args(args)
+        if len(positional) < 2:
+            raise R2PyError("combn requires x and m")
+        func = keyword_arg(args, "FUN")
+        simplify = translate_expr(keyword_arg(args, "simplify", default="True"))
+        func_arg = "None" if func is None else translate_expr(func)
+        return f"combn_py({translate_expr(positional[0])}, {translate_expr(positional[1])}, func={func_arg}, simplify={simplify})"
     if lname == "besselk":
         if len(args) < 2:
             raise R2PyError("besselK requires x and nu")
