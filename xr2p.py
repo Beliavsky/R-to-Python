@@ -5160,6 +5160,7 @@ def translate_expr_code(expr: str) -> str:
     expr = replace_nested_matrix_subscripts(expr)
     expr = replace_nested_vector_subscripts(expr)
     expr = replace_calls(expr)
+    expr = replace_ambiguous_member_access(expr)
     expr = replace_r_colnames_array_subscripts(expr)
     expr = replace_matrix_vector_recycling(expr)
     expr = replace_named_matrix_columns(expr)
@@ -5176,6 +5177,24 @@ def replace_backtick_member_access(expr: str) -> str:
         lambda m: f"{r_name(m.group(1))}[{m.group(2)!r}]",
         expr,
     )
+
+
+def replace_ambiguous_member_access(expr: str) -> str:
+    """Use r_member for $ names that collide with pandas attributes."""
+    ambiguous = {
+        "columns", "count", "index", "kurt", "max", "mean", "median",
+        "min", "mode", "prod", "quantile", "rank", "sample", "shape",
+        "size", "skew", "std", "sum", "values", "var",
+    }
+    attrs = "|".join(sorted(ambiguous, key=len, reverse=True))
+    nested = r"(?:[^()]|\([^()]*\))*"
+    base = rf"(?:[A-Za-z_]\w*\({nested}\)|[A-Za-z_]\w*(?:(?:@@MEM@@|\.)[A-Za-z_]\w*)*)"
+    pattern = re.compile(rf"({base})@@MEM@@({attrs})\b")
+    while True:
+        updated = pattern.sub(lambda m: f"r_member({m.group(1).replace('@@MEM@@', '.')}, {m.group(2)!r})", expr)
+        if updated == expr:
+            return expr
+        expr = updated
 
 
 def replace_pipe_operator(expr: str, op: str) -> str:
