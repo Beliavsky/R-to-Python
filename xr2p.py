@@ -655,6 +655,7 @@ def sanitize_python_syntax_names(python: str) -> str:
         "is.numeric": "r_is_numeric",
         "is.vector": "r_is_vector",
         "is.matrix": "r_is_matrix",
+        "is.null": "r_is_null",
         "is.na": "np.isnan",
         "is.nan": "np.isnan",
         "is.finite": "np.isfinite",
@@ -1849,6 +1850,29 @@ def r_sapply(x, func):
             names = [str(v) for v in np.atleast_1d(np.asarray(x))]
         return RNamedVector(out, names)
     return out
+""".strip()
+        )
+    if "r_filter(" in python or "r_negate(" in python or "r_is_null" in python:
+        helpers.append(
+            """
+def r_is_null(value):
+    return value is None
+
+
+def r_negate(func):
+    return lambda *args, **kwargs: not bool(func(*args, **kwargs))
+
+
+def r_filter(func, values):
+    if "RList" in globals() and isinstance(values, RList):
+        names = [name for name in values._r_names if func(getattr(values, name))]
+        return RList(**{name: getattr(values, name) for name in names}, _r_names=names)
+    if isinstance(values, dict):
+        return {name: value for name, value in values.items() if func(value)}
+    kept = [value for value in values if func(value)]
+    if isinstance(values, np.ndarray):
+        return np.asarray(kept)
+    return kept
 """.strip()
         )
     if "r_mapply(" in python:
@@ -5899,6 +5923,14 @@ def is_logical_subscript(index: str) -> bool:
 
 def translate_call(name: str, args: list[str]) -> str:
     lname = name.lower()
+    if lname == "negate":
+        if not args:
+            raise R2PyError("Negate requires a function")
+        return f"r_negate({translate_expr(args[0])})"
+    if lname == "filter":
+        if len(args) < 2:
+            raise R2PyError("Filter requires a function and values")
+        return f"r_filter({translate_expr(args[0])}, {translate_expr(args[1])})"
     if lname == "lm":
         return translate_lm_call(args)
     if lname == "glm":
