@@ -3925,7 +3925,14 @@ def resolve_nonlocal_assignments(python: str) -> str:
             continue
 
         if re.match(r"\s*def\s+[A-Za-z_]\w*\s*\(", line):
-            frames.append({"indent": indent, "parent": stack[-1] if stack else None, "assigned": set()})
+            frames.append(
+                {
+                    "indent": indent,
+                    "line": i,
+                    "parent": stack[-1] if stack else None,
+                    "assigned": set(),
+                }
+            )
             stack.append(len(frames) - 1)
             continue
 
@@ -3933,7 +3940,12 @@ def resolve_nonlocal_assignments(python: str) -> str:
         if assign and stack:
             frames[stack[-1]]["assigned"].add(assign.group(1))
 
-    for i, name, frame_id in markers:
+    declarations: dict[int, dict[str, set[str]]] = {}
+    marker_lines = {i for i, _, _ in markers}
+    for _, name, frame_id in markers:
+        if frame_id is None:
+            # At module scope an ordinary assignment already has global scope.
+            continue
         parent = frames[frame_id]["parent"] if frame_id is not None else None
         found_nonlocal = False
         while parent is not None:
@@ -3941,10 +3953,28 @@ def resolve_nonlocal_assignments(python: str) -> str:
                 found_nonlocal = True
                 break
             parent = frames[parent]["parent"]
-        prefix = " " * indent_of(lines[i])
-        lines[i] = f"{prefix}{'nonlocal' if found_nonlocal else 'global'} {name}"
+        kind = "nonlocal" if found_nonlocal else "global"
+        declarations.setdefault(frame_id, {"nonlocal": set(), "global": set()})[kind].add(name)
 
-    return "\n".join(lines).rstrip() + "\n"
+    declarations_by_line = {
+        int(frames[frame_id]["line"]): (frame_id, names)
+        for frame_id, names in declarations.items()
+    }
+    out: list[str] = []
+    for i, line in enumerate(lines):
+        if i not in marker_lines:
+            out.append(line)
+        declaration = declarations_by_line.get(i)
+        if declaration is None:
+            continue
+        frame_id, names = declaration
+        prefix = " " * (int(frames[frame_id]["indent"]) + len(INDENT))
+        if names["nonlocal"]:
+            out.append(prefix + "nonlocal " + ", ".join(sorted(names["nonlocal"])))
+        if names["global"]:
+            out.append(prefix + "global " + ", ".join(sorted(names["global"])))
+
+    return "\n".join(out).rstrip() + "\n"
 
 
 def add_blank_lines_after_functions(python: str) -> str:
