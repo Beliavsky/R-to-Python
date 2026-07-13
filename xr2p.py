@@ -3625,7 +3625,22 @@ def rbind_py(*rows, **named_rows):
     if named_rows:
         rows = list(rows) + list(named_rows.values())
     if any(isinstance(row, pd.DataFrame) for row in rows):
-        return pd.concat(rows, axis=0, ignore_index=True)
+        template = next(row for row in rows if isinstance(row, pd.DataFrame))
+        frames = []
+        for row in rows:
+            if isinstance(row, pd.DataFrame):
+                frames.append(row.reset_index(drop=True))
+                continue
+            arr = np.asarray(row)
+            if arr.ndim == 0:
+                arr = arr.reshape((1, 1))
+            elif arr.ndim == 1:
+                arr = arr.reshape((1, -1))
+            frame = pd.DataFrame(arr)
+            if frame.shape[1] == template.shape[1]:
+                frame.columns = template.columns
+            frames.append(frame)
+        return pd.concat(frames, axis=0, ignore_index=True)
     if rows and all("RNamedVector" in globals() and isinstance(row, RNamedVector) for row in rows):
         # R keeps the shared names as column names when binding named vectors.
         data = np.vstack([np.asarray(row.values).reshape((1, -1)) for row in rows])
