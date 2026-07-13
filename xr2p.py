@@ -2000,8 +2000,8 @@ def integrate_py(f, lower, upper, rel_tol=1e-7, subdivisions=100):
 def try_catch_py(func, fallback):
     try:
         return func()
-    except Exception:
-        return fallback
+    except Exception as exc:
+        return fallback(exc) if callable(fallback) else fallback
 """.strip()
         )
     if "message_py(" in python or "warning_py(" in python or "stop_py(" in python:
