@@ -1351,6 +1351,9 @@ def r_paste(*values, sep=" ", collapse=None):
             out = np.char.add(np.char.add(out, sep), array)
     if collapse is not None:
         return str(collapse).join(out.tolist())
+    if len(out) == 1 and all(np.ndim(value) == 0 for value in values):
+        # Length-1 character results print as plain text, matching R.
+        return str(out[0])
     return out
 """.strip()
         )
@@ -1417,6 +1420,17 @@ def wilcox_test_py(x, y=None, paired=False):
     return RHTest("Wilcoxon rank sum test", {"W": float(stat)}, float(p))
 """.strip()
         )
+    if "r_command_args(" in python:
+        helpers.append(
+            """
+def r_command_args(trailing_only=True):
+    argv = list(sys.argv)
+    if trailing_only:
+        return np.array(argv[1:], dtype=object)
+    # R includes the interpreter and a --file=script entry.
+    return np.array([sys.executable, "--file=" + argv[0], *argv[1:]], dtype=object)
+""".strip()
+        )
     if "r_write_csv(" in python:
         helpers.append(
             """
@@ -1446,6 +1460,9 @@ def r_set_colnames(x, names):
     labels = [str(v) for v in np.atleast_1d(np.asarray(names))]
     if "pd" in globals() and isinstance(x, pd.DataFrame):
         x.columns = labels
+        return x
+    if "pd" in globals() and isinstance(x, np.ndarray) and x.ndim == 2 and x.shape[1] == len(labels):
+        return pd.DataFrame(x, columns=labels)
     return x
 
 
@@ -1759,7 +1776,8 @@ def regex_grep(pattern, x, value=False):
 
 def regex_sub(pattern, repl, x, global_replace=False):
     count = 0 if global_replace else 1
-    return np.array([re.sub(pattern, repl, str(item), count=count) for item in np.atleast_1d(np.asarray(x))])
+    out = np.array([re.sub(pattern, repl, str(item), count=count) for item in np.atleast_1d(np.asarray(x))])
+    return str(out[0]) if np.ndim(x) == 0 else out
 
 
 def regex_regexpr(pattern, x):
@@ -3147,7 +3165,7 @@ def r_format(x, digits=None):
         return f"{x:.7g}"
     return str(x)
 
-def r_print(*args, digits=None, colnames=None):
+def r_print(*args, digits=None, colnames=None, row_names=True):
     if len(args) != 1:
         print(*args)
         return
@@ -3163,7 +3181,11 @@ def r_print(*args, digits=None, colnames=None):
     elif "pd" in globals() and isinstance(x, pd.DatetimeIndex):
         print(" ".join(x.strftime("%Y-%m-%d").to_list()))
     elif "pd" in globals() and isinstance(x, pd.DataFrame):
-        print(x.to_string())
+        frame = x
+        if isinstance(frame.index, pd.RangeIndex) and frame.index.start == 0 and frame.index.step == 1:
+            frame = frame.copy()
+            frame.index = frame.index + 1
+        print(frame.to_string(index=bool(row_names), na_rep="NA"))
     elif "pd" in globals() and isinstance(x, pd.Series):
         values = [r_format(v, digits) for v in x.to_numpy()]
         if x.index.dtype == bool:
@@ -5965,6 +5987,9 @@ def translate_call(name: str, args: list[str]) -> str:
     if lname == "print":
         print_args = positional_args(args)
         print_py_args = [translate_expr(arg) for arg in print_args]
+        row_names = keyword_arg(args, "row.names")
+        if row_names is not None and len(print_args) == 1:
+            return f"r_print({print_py_args[0]}, row_names={translate_expr(row_names)})"
         if len(print_args) == 1:
             raw_call = parse_full_call(print_args[0])
             if raw_call is not None and raw_call[0].lower() == "round" and len(raw_call[1]) >= 2:
@@ -6211,7 +6236,9 @@ def translate_call(name: str, args: list[str]) -> str:
     if lname == "sys.time":
         return "pd.Timestamp.now()"
     if lname == "commandargs":
-        return "np.delete(np.array(sys.argv, dtype=object), 0)"
+        trailing = positional_args(args)[0].strip().upper() if positional_args(args) else keyword_arg(args, "trailingOnly", default="TRUE").strip().upper()
+        trailing_only = trailing not in {"FALSE", "F"}
+        return f"r_command_args({trailing_only})"
     if lname == "interactive":
         return "False"
     if lname == "identical":
