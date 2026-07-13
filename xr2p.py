@@ -5031,6 +5031,36 @@ def replace_parenthesized_if_else_exprs(expr: str) -> str:
             return expr
 
 
+def mask_inline_if_call_arguments(expr: str) -> str:
+    """Protect inline if/else call arguments from innermost-call rewrites."""
+    parsed = parse_full_call(expr)
+    if parsed is None:
+        return expr
+    name, args = parsed
+    changed = False
+    rebuilt: list[str] = []
+    for arg in args:
+        pos = find_top_level_operator(arg, "=")
+        if pos >= 0 and not (
+            (pos > 0 and arg[pos - 1] in "<>!")
+            or (pos + 1 < len(arg) and arg[pos + 1] == "=")
+        ):
+            prefix = arg[: pos + 1]
+            value = arg[pos + 1 :].strip()
+        else:
+            prefix = ""
+            value = arg.strip()
+        translated = translate_if_else_expr(value)
+        if translated is None:
+            rebuilt.append(arg)
+            continue
+        rebuilt.append(prefix + mask_lambda(translated))
+        changed = True
+    if not changed:
+        return expr
+    return f"{name}(" + ", ".join(rebuilt) + ")"
+
+
 def translate_expr(expr: str) -> str:
     expr = expr.strip().rstrip(";")
     backtick_op = re.fullmatch(r"`([^`\w]+)`", expr)
@@ -5043,6 +5073,7 @@ def translate_expr(expr: str) -> str:
     if if_else is not None:
         return if_else
     expr = replace_parenthesized_if_else_exprs(expr)
+    expr = mask_inline_if_call_arguments(expr)
     det_mod = translate_determinant_modulus_expr(expr)
     if det_mod is not None:
         return det_mod
