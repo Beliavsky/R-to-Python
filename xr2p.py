@@ -1039,6 +1039,8 @@ def match_fun(f):
         helpers.append(
             """
 def r_length(x):
+    if x is None:
+        return 0
     if isinstance(x, (str, bytes)):
         return 1
     if "RNamedVector" in globals() and isinstance(x, RNamedVector):
@@ -1701,6 +1703,75 @@ def r_rownames(x, fallback=None):
     if fallback:
         return np.array(fallback)
     return np.array(getattr(x, "rownames", []))
+""".strip()
+        )
+    if "r_and(" in python or "r_or(" in python or "r_na_of(" in python:
+        helpers.append(
+            """
+def _r_kleene(a, b, is_and):
+    aa = np.atleast_1d(np.asarray(a, dtype=object))
+    bb = np.atleast_1d(np.asarray(b, dtype=object))
+    n = max(len(aa), len(bb)) if len(aa) and len(bb) else 0
+    aa = np.resize(aa, n)
+    bb = np.resize(bb, n)
+    out = np.empty(n, dtype=object)
+    for i in range(n):
+        x, y = aa[i], bb[i]
+        xn = x is None or (isinstance(x, float) and np.isnan(x))
+        yn = y is None or (isinstance(y, float) and np.isnan(y))
+        xt = None if xn else bool(x)
+        yt = None if yn else bool(y)
+        if is_and:
+            out[i] = False if (xt is False or yt is False) else (np.nan if (xt is None or yt is None) else True)
+        else:
+            out[i] = True if (xt is True or yt is True) else (np.nan if (xt is None or yt is None) else False)
+    scalar = np.ndim(a) == 0 and np.ndim(b) == 0
+    if not any(isinstance(v, float) and np.isnan(v) for v in out):
+        out = out.astype(bool)
+    return out[0] if scalar else out
+
+
+def r_and(a, b):
+    return _r_kleene(a, b, True)
+
+
+def r_or(a, b):
+    return _r_kleene(a, b, False)
+
+
+def r_na_of(x):
+    n = np.ndim(x)
+    if n == 0:
+        return np.nan
+    return np.full(np.atleast_1d(np.asarray(x)).shape, np.nan)
+""".strip()
+        )
+    if "r_ifelse(" in python:
+        helpers.append(
+            """
+def r_ifelse(test, yes, no):
+    t = np.atleast_1d(np.asarray(test))
+    n = t.shape[0]
+    yes = np.resize(np.atleast_1d(np.asarray(yes, dtype=object)), n)
+    no = np.resize(np.atleast_1d(np.asarray(no, dtype=object)), n)
+    out = np.empty(n, dtype=object)
+    for i in range(n):
+        ti = t[i]
+        if ti is None or (isinstance(ti, float) and np.isnan(ti)):
+            out[i] = np.nan
+        elif bool(ti):
+            out[i] = yes[i]
+        else:
+            out[i] = no[i]
+    non_na = [v for v in out if not (isinstance(v, float) and np.isnan(v))]
+    if non_na and all(isinstance(v, (bool, np.bool_, int, float, np.number)) for v in non_na):
+        result = np.array([np.nan if (isinstance(v, float) and np.isnan(v)) else v for v in out], dtype=float)
+    elif any(isinstance(v, str) for v in non_na):
+        result = np.array([v if (isinstance(v, float) and np.isnan(v)) else str(v) for v in out], dtype=object)
+    else:
+        result = out
+    scalar = np.ndim(test) == 0
+    return result[0] if scalar else result
 """.strip()
         )
     if "r_axis_index(" in python:
@@ -3421,13 +3492,17 @@ nagarch_negloglik_fast = _nagarch_negloglik_fast_impl
         helpers.append(
             """
 def r_format(x, digits=None):
+    if x is None:
+        return "NA"
     if isinstance(x, (bool, np.bool_)):
         return "TRUE" if x else "FALSE"
     if isinstance(x, (np.integer, int)):
         return str(int(x))
     if isinstance(x, (np.floating, float)):
+        if np.isnan(x):
+            return "NA"
         if not np.isfinite(x):
-            return str(x)
+            return "Inf" if x > 0 else "-Inf"
         if digits is not None:
             return f"{x:.{int(digits)}f}"
         if x == int(x):
@@ -5442,6 +5517,7 @@ def translate_expr_code(expr: str) -> str:
     expr = re.sub(r"!\s*(?!=)", "not ", expr)
     expr = replace_complex_literals(expr)
     expr = replace_power(expr)
+    expr = replace_na_comparisons(expr)
     expr = replace_r_constants(expr)
     expr = replace_ranges(expr)
     expr = replace_r_subscripts(expr)
@@ -5637,6 +5713,40 @@ def scan_operand_right(expr: str, pos: int) -> int:
     return i
 
 
+def replace_na_comparisons(expr: str) -> str:
+    """Any comparison with the NA literal yields NA (R semantics)."""
+    if not re.search(r"(?<![\w.])NA(?![\w.])", expr):
+        return expr
+    ops = ["==", "!=", "<=", ">=", "<", ">"]
+    changed = True
+    while changed:
+        changed = False
+        for m in re.finditer(r"(?<![\w.])NA(?![\w.])", expr):
+            pos, end = m.start(), m.end()
+            after = expr[end:]
+            stripped_after = after.lstrip()
+            op_here = next((op for op in ops if stripped_after.startswith(op)), None)
+            if op_here is not None:
+                op_start = end + (len(after) - len(stripped_after)) + len(op_here)
+                right_end = scan_operand_right(expr, op_start)
+                operand = expr[op_start:right_end].strip()
+                if operand:
+                    expr = expr[:pos] + f"r_na_of({operand})" + expr[right_end:]
+                    changed = True
+                    break
+            before = expr[:pos].rstrip()
+            op_left = next((op for op in ops if before.endswith(op)), None)
+            if op_left is not None:
+                op_pos = len(before) - len(op_left)
+                left_start = scan_operand_left(expr, op_pos)
+                operand = expr[left_start:op_pos].strip()
+                if operand:
+                    expr = expr[:left_start] + f"r_na_of({operand})" + expr[end:]
+                    changed = True
+                    break
+    return expr
+
+
 def normalize_logical_operators(expr: str) -> str:
     expr = expr.strip()
     expr = strip_outer_parens(expr) if expr.startswith("(") and expr.endswith(")") else expr
@@ -5647,13 +5757,13 @@ def normalize_logical_operators(expr: str) -> str:
     if pos >= 0:
         left = normalize_logical_operators(expr[:pos])
         right = normalize_logical_operators(expr[pos + 1 :])
-        return f"({left}) | ({right})"
+        return f"r_or({left}, {right})"
 
     pos = find_top_level_operator(expr, "&")
     if pos >= 0:
         left = normalize_logical_operators(expr[:pos])
         right = normalize_logical_operators(expr[pos + 1 :])
-        return f"({left}) & ({right})"
+        return f"r_and({left}, {right})"
 
     return expr
 
@@ -6695,7 +6805,7 @@ def translate_call(name: str, args: list[str]) -> str:
     if lname == "regexpr":
         return f"regex_regexpr({py_args[0]}, {py_args[1]})"
     if lname == "ifelse":
-        return "np.where(" + ", ".join(py_args) + ")"
+        return "r_ifelse(" + ", ".join(py_args) + ")"
     if lname == "sqrt":
         return f"np.sqrt({py_args[0]})"
     if lname == "re":
@@ -8280,7 +8390,7 @@ def scipy_dist_params(family: str, args: list[str]) -> tuple[str, list[str]]:
 
 def keyword_arg(args: list[str], name: str, default: str | None = None) -> str | None:
     for arg in args:
-        pos = find_top_level_operator(arg, "=")
+        pos = find_top_level_assignment_equal(arg)
         if pos >= 0 and normalize_keyword_name(arg[:pos].strip()).lower() == normalize_keyword_name(name).lower():
             return arg[pos + 1 :].strip()
     return default
@@ -8330,7 +8440,7 @@ def apply_partial_argument_matching(name: str, args: list[str]) -> list[str]:
 
 
 def positional_args(args: list[str]) -> list[str]:
-    return [arg for arg in args if find_top_level_operator(arg, "=") < 0]
+    return [arg for arg in args if find_top_level_assignment_equal(arg) < 0]
 
 
 def replace_names(expr: str) -> str:
