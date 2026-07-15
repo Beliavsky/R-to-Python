@@ -3262,6 +3262,15 @@ def r_names(x):
     return None
 
 
+def r_unname(x):
+    if "RNamedVector" in globals() and isinstance(x, RNamedVector):
+        values = np.asarray(x.values)
+        return values.item() if values.ndim == 0 else values
+    if "pd" in globals() and isinstance(x, pd.Series):
+        return x.to_numpy()
+    return x
+
+
 def r_setdiff(x, y):
     left = np.ravel(np.asarray(x, dtype=object))
     right = set(np.ravel(np.asarray(y, dtype=object)).tolist())
@@ -6950,6 +6959,8 @@ def translate_call(name: str, args: list[str]) -> str:
         return "np.char.upper(np.asarray(" + py_args[0] + ", dtype=str))"
     if lname == "tolower":
         return "np.char.lower(np.asarray(" + py_args[0] + ", dtype=str))"
+    if lname == "unname":
+        return "r_unname(" + py_args[0] + ")"
     if lname == "substr":
         x = py_args[0]
         start = py_args[1]
