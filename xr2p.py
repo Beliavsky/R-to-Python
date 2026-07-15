@@ -609,6 +609,16 @@ def expand_one_line_control(line: str) -> list[str]:
             if expanded_block is not None:
                 return expanded_block
             return [line]
+        split = split_top_level_else(tail)
+        if split is not None:
+            yes, no = split
+            if yes and no:
+                return [
+                    f"{indent}{head} {{",
+                    f"{indent}{INDENT}{yes}",
+                    f"{indent}}}",
+                    *expand_one_line_control(f"{indent}else {no}"),
+                ]
         return [f"{indent}{head} {{", f"{indent}{INDENT}{tail}", f"{indent}}}"]
     parsed_else = parse_one_line_else(line)
     if parsed_else is not None:
@@ -657,8 +667,6 @@ def expand_braced_control_tail(head: str, tail: str, indent: str) -> list[str] |
     if not inner and not remainder:
         return None
     body_lines = [part for part in brace_block_to_r_text(inner).split("\n") if part]
-    if len(body_lines) <= 1 and not remainder:
-        return None
     out = [f"{indent}{head} {{", *(f"{indent}{INDENT}{part}" for part in body_lines), f"{indent}}}"]
     if remainder:
         out.extend(expand_one_line_control(f"{indent}{remainder}"))
