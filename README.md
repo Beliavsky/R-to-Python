@@ -25,21 +25,24 @@ For a quick feel for the generated code, see [small translation examples](docs/e
 Translate an R file:
 
 ```bat
-python xr2p.py fixtures\xseq.r
+python xr2p.py analysis.r
 ```
 
-This writes `fixtures\xseq.py`.
+This writes `analysis.py` in the working directory. Input files can be located
+anywhere; relative paths are resolved from the current working directory and
+absolute paths are also accepted. The repository's `fixtures/` directory is
+used for regression tests and is not required for normal translation.
 
 Translate and run the generated Python:
 
 ```bat
-python xr2p.py fixtures\xseq.r --run
+python xr2p.py analysis.r --run
 ```
 
 Run both the original R script and generated Python:
 
 ```bat
-python xr2p.py fixtures\xseq.r --run-both
+python xr2p.py analysis.r --run-both
 ```
 
 Use the most recently modified `.r` or `.R` file in the current directory:
@@ -51,28 +54,28 @@ python xr2p.py @last --run
 Print the generated Python while writing it:
 
 ```bat
-python xr2p.py fixtures\xseq.r --tee
+python xr2p.py analysis.r --tee
 ```
 
 Print both the original R source and generated Python:
 
 ```bat
-python xr2p.py fixtures\xseq.r --tee-both
+python xr2p.py analysis.r --tee-both
 ```
 
 Skip Python syntax checking:
 
 ```bat
-python xr2p.py fixtures\xseq.r --no-py-compile
+python xr2p.py analysis.r --no-py-compile
 ```
 
 Generated files start with a banner comment recording the source file and
 translation time, for example
-`# Translated from fixtures\xseq.r by xr2p.py on 2026-07-12 10:00:56.`
+`# Translated from analysis.r by xr2p.py on 2026-07-12 10:00:56.`
 Suppress it with:
 
 ```bat
-python xr2p.py fixtures\xseq.r --no-banner
+python xr2p.py analysis.r --no-banner
 ```
 
 ## Useful command-line options
@@ -80,49 +83,49 @@ python xr2p.py fixtures\xseq.r --no-banner
 Show nonblank, noncomment lines of code for R and Python:
 
 ```bat
-python xr2p.py fixtures\xseq.r --loc
+python xr2p.py analysis.r --loc
 ```
 
 Run Python with transpilation and run time displayed:
 
 ```bat
-python xr2p.py fixtures\xseq.r --time
+python xr2p.py analysis.r --time
 ```
 
 Run both R and Python with timing:
 
 ```bat
-python xr2p.py fixtures\xseq.r --time-both
+python xr2p.py analysis.r --time-both
 ```
 
 Try to remove unused generated helpers from the output:
 
 ```bat
-python xr2p.py fixtures\xseq.r --lean
+python xr2p.py analysis.r --lean
 ```
 
 Move generated runtime helpers into `xr2p_runtime.py`:
 
 ```bat
-python xr2p.py fixtures\xseq.r --runtime-module
+python xr2p.py analysis.r --runtime-module
 ```
 
 Keep only needed runtime helpers in that module:
 
 ```bat
-python xr2p.py fixtures\xseq.r --runtime-module --prune-runtime
+python xr2p.py analysis.r --runtime-module --prune-runtime
 ```
 
 Refresh an existing runtime module:
 
 ```bat
-python xr2p.py fixtures\xseq.r --runtime-module --update-runtime
+python xr2p.py analysis.r --runtime-module --update-runtime
 ```
 
 Disable generated numba fast paths:
 
 ```bat
-python xr2p.py fixtures\xseq.r --no-numba
+python xr2p.py analysis.r --no-numba
 ```
 
 `--lean` and `--prune-runtime` check that the slimmed output still compiles. If
@@ -133,13 +136,13 @@ not, `xr2p.py` falls back to the safer unslimmed output and prints a warning.
 Run both R and Python and show a unified output diff:
 
 ```bat
-python xr2p.py fixtures\xseq.r --run-diff
+python xr2p.py analysis.r --run-diff
 ```
 
 Normalize common R/Python formatting differences in R output:
 
 ```bat
-python xr2p.py fixtures\xseq.r --run-both --pretty
+python xr2p.py analysis.r --run-both --pretty
 ```
 
 `--pretty` removes R display markers like `[1]`, maps `TRUE`/`FALSE` to
@@ -149,7 +152,7 @@ strings.
 Compare numeric output summaries instead of full text:
 
 ```bat
-python xr2p.py fixtures\xseq.r --stats
+python xr2p.py analysis.r --stats
 ```
 
 `--stats` scans output for numeric values and reports count, minimum, maximum,
@@ -158,13 +161,13 @@ and sum for R and Python output.
 Round numeric output before comparison:
 
 ```bat
-python xr2p.py fixtures\xseq.r --run-diff --round-both 6
+python xr2p.py analysis.r --run-diff --round-both 6
 ```
 
 Make displayed output easier to compare visually:
 
 ```bat
-python xr2p.py fixtures\xseq.r --run-both --flush-left --squeeze
+python xr2p.py analysis.r --run-both --flush-left --squeeze
 ```
 
 `--flush-left` strips leading whitespace from displayed lines. `--squeeze`
@@ -181,7 +184,7 @@ python scripts\xr2p_ide.py
 Open an R file directly:
 
 ```bat
-python scripts\xr2p_ide.py fixtures\xseq.r
+python scripts\xr2p_ide.py analysis.r
 ```
 
 The GUI is a thin wrapper around `xr2p.py`. It provides:
@@ -305,19 +308,19 @@ changes are intentionally excluded, making this a useful final pre-push check.
 patterns, `@` lists, or directories:
 
 ```bat
-python xr2p_batch.py fixtures\*.r --quiet
+python xr2p_batch.py *.r --quiet
 ```
 
 Add syntax checking:
 
 ```bat
-python xr2p_batch.py fixtures\*.r --quiet --check-syntax
+python xr2p_batch.py *.r --quiet --check-syntax
 ```
 
 Run generated Python as well:
 
 ```bat
-python xr2p_batch.py fixtures\*.r --run --quiet
+python xr2p_batch.py *.r --run --quiet
 ```
 
 Run recursively over a downloaded corpus and save generated Python plus a CSV
