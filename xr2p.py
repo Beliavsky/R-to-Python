@@ -5048,7 +5048,10 @@ def translate_function_signature(args: str) -> tuple[str, list[str]]:
             continue
         pos = find_top_level_operator(arg, "=")
         if pos >= 0:
-            name = r_name(arg[:pos].strip())
+            raw_name = arg[:pos].strip()
+            if is_string_literal(raw_name):
+                raw_name = raw_name[1:-1]
+            name = r_name(raw_name)
             value = translate_expr(arg[pos + 1 :].strip())
             if expr_references_names(value, previous):
                 out.append(f"{name}=None")
@@ -8011,7 +8014,13 @@ def translate_list_call(args: list[str]) -> str:
     for i, arg in enumerate(args):
         pos = find_top_level_operator(arg, "=")
         if pos >= 0:
-            name = r_name(arg[:pos].strip())
+            raw_name = arg[:pos].strip()
+            masked_name = masked_string_text(raw_name)
+            if masked_name is not None and is_string_literal(masked_name):
+                raw_name = masked_name[1:-1]
+            elif is_string_literal(raw_name):
+                raw_name = raw_name[1:-1]
+            name = r_name(raw_name)
             value = translate_expr(arg[pos + 1 :].strip())
         else:
             name = f"x{i + 1}"
