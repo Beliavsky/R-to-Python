@@ -67,7 +67,7 @@ python xr2p.py analysis.r --no-py-compile
 ```
 
 Generated files start with a banner comment recording the source file and
-translation time, for example
+translation time, for example<br>
 `# Translated from analysis.r by xr2p.py on 2026-07-12 10:00:56.`
 Suppress it with:
 
