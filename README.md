@@ -28,10 +28,7 @@ Translate an R file:
 python xr2p.py analysis.r
 ```
 
-This writes `analysis.py` in the working directory. Input files can be located
-anywhere; relative paths are resolved from the current working directory and
-absolute paths are also accepted. The repository's `fixtures/` directory is
-used for regression tests and is not required for normal translation.
+This writes `analysis.py`.
 
 Translate and run the generated Python:
 
