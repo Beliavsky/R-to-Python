@@ -6995,10 +6995,32 @@ def translate_call(name: str, args: list[str]) -> str:
         return f"np.{lname}(" + ", ".join(py_args) + ")"
     if lname == "gamma":
         return "special.gamma(" + ", ".join(py_args) + ")"
+    if lname == "lgamma":
+        return "special.gammaln(" + ", ".join(py_args) + ")"
+    if lname == "beta":
+        return "special.beta(" + ", ".join(py_args) + ")"
+    if lname == "lbeta":
+        return "special.betaln(" + ", ".join(py_args) + ")"
+    if lname == "digamma":
+        return "special.digamma(" + py_args[0] + ")"
+    if lname == "trigamma":
+        return "special.polygamma(1, " + py_args[0] + ")"
+    if lname == "psigamma":
+        deriv = translate_expr(keyword_arg(args, "deriv", default=args[1] if len(args) > 1 else "0"))
+        return "special.polygamma(" + deriv + ", " + py_args[0] + ")"
     if lname == "choose":
         if len(py_args) < 2:
             raise R2PyError("choose requires n and k")
         return f"special.comb({py_args[0]}, {py_args[1]}, exact=False)"
+    if lname == "lchoose":
+        if len(py_args) < 2:
+            raise R2PyError("lchoose requires n and k")
+        n, k = py_args[:2]
+        return f"(special.gammaln(({n}) + 1) - special.gammaln(({k}) + 1) - special.gammaln(({n}) - ({k}) + 1))"
+    if lname == "factorial":
+        return "special.factorial(" + py_args[0] + ", exact=False)"
+    if lname == "lfactorial":
+        return "special.gammaln((" + py_args[0] + ") + 1)"
     if lname == "combn":
         positional = positional_args(args)
         if len(positional) < 2:
