@@ -287,18 +287,6 @@ Git; regenerate them locally when needed.
 Some fixtures are exploratory examples. Not every local `x*.r` file is part of
 the hard pytest contract.
 
-To test exactly what a commit contains before pushing it, clone the local Git
-repository into a new directory and run pytest there:
-
-```bat
-git clone . ..\R-to-Python-clean-test
-cd ..\R-to-Python-clean-test
-python -m pytest -q
-```
-
-Only committed files appear in this clone. Staged and unstaged working-tree
-changes are intentionally excluded, making this a useful final pre-push check.
-
 ## Batch translation checks
 
 `xr2p_batch.py` can run translation sweeps over user-provided R files, glob
