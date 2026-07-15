@@ -1,0 +1,5 @@
+x = paste("dog", "cat")
+print(x)
+x = paste("dog", "cat", sep="")
+print(x)
+print(paste0("dog", "cat"))

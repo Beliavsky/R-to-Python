@@ -1,0 +1,5 @@
+a <- outer(1:3, 1:4, FUN = function(i, j) i - j)
+print(a)
+print(a[,])
+print(a[1:2,])
+print(a[1:2, -2])
