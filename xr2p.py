@@ -283,7 +283,9 @@ def register_user_operators(source: str) -> None:
 def register_user_functions(source: str) -> None:
     """Record names bound to function definitions so user code shadows built-ins."""
     for match in re.finditer(r"(?<![\w.$@])([A-Za-z.][\w.]*)\s*(?:<-|=)\s*function\s*\(", source):
-        USER_DEFINED_FUNCS.add(r_function_name(match.group(1)))
+        py_name = r_function_name(match.group(1))
+        USER_DEFINED_FUNCS.add(py_name)
+        USER_FUNCTION_NAMES.add(py_name)
 
 
 def register_replacement_funcs(source: str) -> None:
@@ -3842,6 +3844,20 @@ def cor_py(x, y=None, use=None):
     return np.corrcoef(x[mask], y[mask])[0, 1]
 """.strip()
         )
+    if "r_cov2cor(" in python:
+        helpers.append(
+            """
+def r_cov2cor(x):
+    arr = np.asarray(x, dtype=float)
+    scale = np.sqrt(np.diag(arr))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = arr / np.outer(scale, scale)
+    np.fill_diagonal(out, 1.0)
+    if isinstance(x, pd.DataFrame):
+        return pd.DataFrame(out, index=x.index, columns=x.columns)
+    return out
+""".strip()
+        )
     if "complete_cases_py(" in python:
         helpers.append(
             """
@@ -7013,9 +7029,16 @@ def translate_call(name: str, args: list[str]) -> str:
     if lname == "backsolve":
         return translate_backsolve_call(args)
     if lname == "diag":
-        if len(py_args) >= 2:
-            return "(np.eye(int(" + py_args[1] + ")) * (" + py_args[0] + "))"
-        return "(np.eye(int(" + py_args[0] + ")) if np.isscalar(" + py_args[0] + ") else np.diag(" + py_args[0] + "))"
+        positional = positional_args(args)
+        x_arg = keyword_arg(args, "x", default=positional[0] if positional else "1")
+        nrow_arg = keyword_arg(args, "nrow", default=positional[1] if len(positional) > 1 else None)
+        ncol_arg = keyword_arg(args, "ncol", default=positional[2] if len(positional) > 2 else nrow_arg)
+        x = translate_expr(x_arg)
+        if nrow_arg is not None:
+            nrow = translate_expr(nrow_arg)
+            ncol = translate_expr(ncol_arg)
+            return f"(np.eye(int({nrow}), int({ncol})) * np.resize(np.ravel({x}), int({ncol})))"
+        return f"(np.eye(int({x})) if np.isscalar({x}) else np.diag({x}))"
     if lname == "toeplitz":
         return "linalg.toeplitz(" + py_args[0] + ")"
     if lname == "lower.tri":
@@ -7079,6 +7102,8 @@ def translate_call(name: str, args: list[str]) -> str:
         if len(py_args) == 1:
             return "np.cov(" + py_args[0] + ", rowvar=False, ddof=1)"
         return "np.cov(" + py_args[0] + ", " + py_args[1] + ", ddof=1)"
+    if lname == "cov2cor":
+        return "r_cov2cor(" + py_args[0] + ")"
     if lname == "cor":
         cor_args = positional_args(args)
         cor_py_args = [translate_expr(arg) for arg in cor_args]
@@ -8098,7 +8123,12 @@ def translate_backsolve_call(args: list[str]) -> str:
     b = translate_expr(args[1])
     transpose = translate_expr(keyword_arg(args, "transpose", default="False"))
     mat = f"({r}).T" if transpose == "True" else r
-    return f"np.linalg.solve({mat}, {b})"
+    return (
+        f"(lambda _a, _b: np.linalg.solve(_a, "
+        f"np.asarray(_b).ravel() if np.asarray(_b).ndim == 2 "
+        f"and np.asarray(_b).shape == (1, len(np.asarray(_a))) else _b))"
+        f"({mat}, {b})"
+    )
 
 
 def translate_list_call(args: list[str]) -> str:
