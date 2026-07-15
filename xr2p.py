@@ -1586,6 +1586,8 @@ def r_list_get(x, idx):
             return x[idx]
         if "RList" in globals() and isinstance(x, RList):
             return getattr(x, idx)
+        if isinstance(x, dict):
+            return x.get(idx)
         return getattr(x, idx) if hasattr(x, idx) else x[idx]
     if "RNamedVector" in globals() and isinstance(x, RNamedVector):
         return x.values[int(idx) - 1]
@@ -4744,6 +4746,19 @@ def translate_statement_inner(line: str) -> list[str]:
     if is_metadata_assignment(line):
         return ["pass  # R metadata assignment omitted"]
 
+    member_empty_subscript_assign = re.match(r"^([A-Za-z]\w*)\$([A-Za-z]\w*)\s*\[\s*\]\s*(?:<-|=)\s*(.+)$", line)
+    if member_empty_subscript_assign:
+        obj, field, rhs = member_empty_subscript_assign.groups()
+        py_obj = r_name(obj)
+        py_field = r_name(field)
+        py_rhs = translate_expr(rhs)
+        return [
+            f"if 'pd' in globals() and isinstance({py_obj}, pd.DataFrame):",
+            INDENT + f"{py_obj}.loc[:, {py_field!r}] = {py_rhs}",
+            "else:",
+            INDENT + f"{py_obj}.{py_field} = r_assign_all({py_obj}.{py_field}, {py_rhs})",
+        ]
+
     member_subscript_assign = re.match(r"^([A-Za-z]\w*)\$([A-Za-z]\w*)\s*\[(.+)\]\s*(?:<-|=)\s*(.+)$", line)
     if member_subscript_assign:
         obj, field, index, rhs = member_subscript_assign.groups()
@@ -4753,9 +4768,9 @@ def translate_statement_inner(line: str) -> list[str]:
         py_rhs = translate_expr(rhs)
         return [
             f"if 'pd' in globals() and isinstance({py_obj}, pd.DataFrame):",
-            INDENT + f"{py_obj}.loc[{py_index}, {py_field!r}] = {py_rhs}",
+            INDENT + f"{py_obj}[{py_field!r}] = r_matrix_index_set({py_obj}[{py_field!r}], {py_index}, {py_rhs})",
             "else:",
-            INDENT + f"{py_obj}.{py_field}[{py_index}] = {py_rhs}",
+            INDENT + f"{py_obj}.{py_field} = r_matrix_index_set({py_obj}.{py_field}, {py_index}, {py_rhs})",
         ]
 
     member_assign = re.match(r"^([A-Za-z]\w*)\$([A-Za-z]\w*)\s*(?:<-|=)\s*(.+)$", line)
@@ -6613,6 +6628,10 @@ def translate_call(name: str, args: list[str]) -> str:
     # A user-defined function shadows any built-in of the same name.
     if r_function_name(name) in USER_DEFINED_FUNCS and not name.startswith(("np.", "pd.", "stats.")):
         return translate_user_call(name, args)
+    if lname in {"new.env", "new_env"}:
+        return "{}"
+    if lname in {"emptyenv", "empty.env"}:
+        return "None"
     if lname == "negate":
         if not args:
             raise R2PyError("Negate requires a function")
