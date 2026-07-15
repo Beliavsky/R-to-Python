@@ -364,12 +364,12 @@ Scripts with no stdout are often library/function files rather than standalone
 programs; `xr2p_batch.py --only-r-output burkardt_r_runs.csv` can use that CSV
 to focus on runnable examples.
 
-## Burkardt-style source paths
+## Rewriting machine-specific `source()` paths
 
 Some public R corpora contain absolute `source()` calls that point to the
-author's machine. The repository includes a helper script for rewriting those
-to relative paths in a local corpus copy. Use it on a disposable downloaded
-copy, not on upstream source files you want to keep pristine.
+author's machine. The helper script `scripts/fix_burkardt_sources.py` rewrites
+those calls to relative paths in a local corpus copy. Use it on a disposable
+downloaded copy, not on upstream source files you want to keep pristine.
 
 ## Performance notes
 
