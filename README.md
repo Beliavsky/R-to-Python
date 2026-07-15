@@ -69,7 +69,7 @@ python xr2p.py analysis.r --no-py-compile
 Generated files start with a banner comment recording the source file and
 translation time, for example<br>
 `# Translated from analysis.r by xr2p.py on 2026-07-12 10:00:56.`
-Suppress it with:
+Suppress it with
 
 ```bat
 python xr2p.py analysis.r --no-banner
@@ -324,7 +324,7 @@ Run recursively over a downloaded corpus and save generated Python plus a CSV
 summary:
 
 ```bat
-python xr2p_batch.py c:\rcode\public_domain\burkardt --recursive --check-syntax --out-dir c:\temp\xr2p_burkardt --summary-csv c:\temp\xr2p_burkardt\summary.csv --quiet
+python xr2p_batch.py path\to\r_corpus --recursive --check-syntax --out-dir translated_output --summary-csv translated_output\summary.csv --quiet
 ```
 
 Useful corpus options include:
@@ -350,13 +350,13 @@ to translate and run them.
 Run a recursive R sweep:
 
 ```bat
-python xrbatch.py c:\rcode\public_domain\burkardt --recursive --summary-csv burkardt_r_runs.csv
+python xrbatch.py path\to\r_corpus --recursive --summary-csv r_runs.csv
 ```
 
 Save stdout and stderr for each R script:
 
 ```bat
-python xrbatch.py c:\rcode\public_domain\burkardt --recursive --log-dir c:\temp\r_logs --summary-csv burkardt_r_runs.csv
+python xrbatch.py path\to\r_corpus --recursive --log-dir r_logs --summary-csv r_runs.csv
 ```
 
 The `xrbatch.py` CSV records pass/fail status, elapsed time, and stdout size.
