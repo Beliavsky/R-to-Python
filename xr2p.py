@@ -67,7 +67,7 @@ def translate_source(source: str, *, use_numba: bool = True, source_name: str | 
     register_user_functions(source)
     register_replacement_funcs(source)
     out = ["import numpy as np", ""]
-    out.extend(translate_logical_lines(logical_r_lines(preprocess_simple_inline_r(source))))
+    out.extend(translate_logical_lines(logical_r_lines(preprocess_simple_inline_r(source)), auto_print_top_level=True))
     python = "\n".join(out).rstrip() + "\n"
     python = restore_lambda_masks(python)
     # String placeholders hidden inside masked lambdas miss their local
@@ -312,7 +312,7 @@ def register_dotted_variables(source: str) -> None:
             DOTTED_R_VARS.add(name)
 
 
-def translate_logical_lines(lines: list[str]) -> list[str]:
+def translate_logical_lines(lines: list[str], *, auto_print_top_level: bool = False) -> list[str]:
     out: list[str] = []
     lines = expand_assignment_if_blocks(lines)
     lines = name_anonymous_block_functions(lines)
@@ -337,6 +337,14 @@ def translate_logical_lines(lines: list[str]) -> list[str]:
 
         translated = translate_statement(line)
         if translated:
+            if (
+                auto_print_top_level
+                and indent == 0
+                and len(translated) == 1
+                and re.fullmatch(r"\.?[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", line.strip())
+                and re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", translated[0].strip())
+            ):
+                translated = [f"r_s3_print({translated[0]})"]
             for py_line in translated:
                 out.append(INDENT * indent + py_line)
         if opens:
@@ -591,8 +599,17 @@ def expand_one_line_control(line: str) -> list[str]:
     if brace_else is not None:
         indent, tail = brace_else.groups()
         return [f"{indent}}}", *expand_one_line_control(indent + tail)]
-    if re.match(r"^\s*else\s+if\s*\(", line):
-        return [line]
+    parsed_else_if = parse_one_line_else_if(line)
+    if parsed_else_if is not None:
+        indent, head, tail = parsed_else_if
+        if not tail:
+            return [f"{indent}{head} {{"]
+        if tail.startswith("{"):
+            expanded_block = expand_braced_control_tail(head, tail, indent)
+            if expanded_block is not None:
+                return expanded_block
+            return [line]
+        return [f"{indent}{head} {{", f"{indent}{INDENT}{tail}", f"{indent}}}"]
     parsed_else = parse_one_line_else(line)
     if parsed_else is not None:
         indent, tail = parsed_else
@@ -672,6 +689,20 @@ def parse_one_line_else(line: str) -> tuple[str, str] | None:
     return match.group(1), match.group(2).strip()
 
 
+def parse_one_line_else_if(line: str) -> tuple[str, str, str] | None:
+    match = re.match(r"^(\s*)else\s+if\s*\(", line)
+    if not match:
+        return None
+    indent = match.group(1)
+    start = line.find("(", match.start())
+    end = find_matching_char(line, start, "(", ")")
+    if end < 0:
+        return None
+    head = line[len(indent) : end + 1].strip()
+    tail = line[end + 1 :].strip()
+    return indent, head, tail
+
+
 def parse_one_line_control(line: str) -> tuple[str, str, str] | None:
     match = re.match(r"^(\s*)((?:if|while|for)\s*)\(", line)
     if not match:
@@ -725,6 +756,9 @@ def find_matching_char(text: str, start: int, open_ch: str, close_ch: str) -> in
 
 
 def is_open_control_line(line: str) -> bool:
+    parsed_else_if = parse_one_line_else_if(line)
+    if parsed_else_if is not None:
+        return parsed_else_if[2] in {"", "{"}
     parsed_else = parse_one_line_else(line)
     if parsed_else is not None:
         return parsed_else[1] in {"", "{"}
