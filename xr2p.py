@@ -1850,10 +1850,12 @@ def r_na_of(x):
         helpers.append(
             """
 def r_ifelse(test, yes, no):
-    t = np.atleast_1d(np.asarray(test))
-    n = t.shape[0]
-    yes = np.resize(np.atleast_1d(np.asarray(yes, dtype=object)), n)
-    no = np.resize(np.atleast_1d(np.asarray(no, dtype=object)), n)
+    test_arr = np.asarray(test)
+    test_shape = test_arr.shape
+    t = np.ravel(np.atleast_1d(test_arr), order="F")
+    n = t.size
+    yes = np.resize(np.ravel(np.atleast_1d(np.asarray(yes, dtype=object)), order="F"), n)
+    no = np.resize(np.ravel(np.atleast_1d(np.asarray(no, dtype=object)), order="F"), n)
     out = np.empty(n, dtype=object)
     for i in range(n):
         ti = t[i]
@@ -1871,7 +1873,7 @@ def r_ifelse(test, yes, no):
     else:
         result = out
     scalar = np.ndim(test) == 0
-    return result[0] if scalar else result
+    return result[0] if scalar else result.reshape(test_shape, order="F")
 """.strip()
         )
     if "r_axis_index(" in python:
@@ -6411,7 +6413,8 @@ def translate_matrix_subscript(index: str, *, base: str | None = None) -> str:
         elif axis == 1 and base and (is_string_literal(item) or re.fullmatch(r"__R_STR_\d+__", item)):
             out.append(f"r_col_key({base}, {item}, globals().get('{base}_colnames'))")
         elif axis == 1 and base and re.fullmatch(r"[A-Za-z_][\w.]*", item) and r_name(item) in CHARACTER_VECTOR_VARS:
-            out.append(f"r_col_key({base}, {translate_expr(item)}, globals().get('{base}_colnames'))")
+            col_key = f"r_col_key({base}, {translate_expr(item)}, globals().get('{base}_colnames'))"
+            out.append(f"np.atleast_1d({col_key})" if drop_false else col_key)
         elif axis == 1 and base and is_string_index_expr(item) and not is_likely_dataframe_name(base):
             cols = translate_expr(item)
             out.append(f"np.array([r_col_key({base}, _col, globals().get('{base}_colnames')) for _col in np.ravel({cols})])")
@@ -9829,6 +9832,7 @@ def main(argv: list[str] | None = None) -> int:
         r_elapsed = time.perf_counter() - r_start
         print("Run (R):", "PASS" if r_result.returncode == 0 else f"FAIL exit={r_result.returncode}")
         print_result_output(r_result, r_round_digits, pretty_r=args.pretty, flush_left=args.flush_left, squeeze=args.squeeze)
+        print()
         print("Run (Python):", sys.executable, out)
         py_start = time.perf_counter()
         py_result = run_python(out)
