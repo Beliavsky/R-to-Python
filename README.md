@@ -235,9 +235,13 @@ Support is partial, but the current translator covers a broad base-R subset:
 - Dates, date sequences, date formatting, and simple time series helpers.
 - Random generators and distribution `d`, `p`, and `q` functions using
   NumPy/SciPy where appropriate.
+- Mathematical special functions including `gamma`, `lgamma`, `beta`,
+  `lbeta`, `digamma`, `trigamma`, `psigamma`, `choose`, `lchoose`,
+  `factorial`, `lfactorial`, and selected Bessel functions.
 - Basic modeling/statistics helpers including `lm`, `glm` binomial, `aov`,
   `model.matrix`, `prcomp`, `kmeans`, `arima`, `cor`, `cov`, `eigen`, `svd`,
-  `qr`, `polyroot`, `uniroot`, `integrate`, `kruskal.test`, and `wilcox.test`.
+  `cov2cor`, `qr`, `polyroot`, `uniroot`, `integrate`, `kruskal.test`, and
+  `wilcox.test`.
 - File I/O helpers for CSV, tables, lines, simple text connections, and
   pickle-backed RDS-like save/load.
 - Minimal S3-style class, attributes, `UseMethod`, `try`, `tryCatch`, `stop`,
@@ -265,18 +269,35 @@ Run the Python test suite:
 pytest -q
 ```
 
+The current baseline is 139 passing tests. The suite is self-contained and
+does not require a separate checkout of the R-to-Fortran project.
+
 The tests include:
 
 - Unit-style checks for generated Python snippets.
 - Regression checks for recently added R features.
 - Compile checks for selected fixture scripts.
 - Runtime smoke tests for deterministic fixture scripts.
+- Translation checks for 20 small examples vendored in
+  `fixtures/xr2f_corpus/`.
 
 Fixture scripts live in `fixtures/`. Generated `x*.py` outputs are ignored by
 Git; regenerate them locally when needed.
 
 Some fixtures are exploratory examples. Not every local `x*.r` file is part of
 the hard pytest contract.
+
+To test exactly what a commit contains before pushing it, clone the local Git
+repository into a new directory and run pytest there:
+
+```bat
+git clone . ..\R-to-Python-clean-test
+cd ..\R-to-Python-clean-test
+python -m pytest -q
+```
+
+Only committed files appear in this clone. Staged and unstaged working-tree
+changes are intentionally excluded, making this a useful final pre-push check.
 
 ## Batch translation checks
 
