@@ -318,7 +318,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 dep_source = dep_path.read_text(encoding="utf-8-sig")
                 warnings = source_warnings(dep_source)
-                dep_python = translate_source(dep_source)
+                dep_python = translate_source(dep_source, source_name=str(dep_path))
                 ast.parse(dep_python, filename=str(dep_path.with_suffix(".py")))
                 dep_out_path.parent.mkdir(parents=True, exist_ok=True)
                 dep_out_path.write_text(dep_python, encoding="utf-8")
@@ -342,7 +342,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 source = path.read_text(encoding="utf-8-sig")
                 warnings = source_warnings(source)
-                python = translate_source(source)
+                python = translate_source(source, source_name=str(path))
                 if args.out_dir:
                     out_path.parent.mkdir(parents=True, exist_ok=True)
                     out_path.write_text(python, encoding="utf-8")

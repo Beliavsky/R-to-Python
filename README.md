@@ -66,6 +66,15 @@ Skip Python syntax checking:
 python xr2p.py fixtures\xseq.r --no-py-compile
 ```
 
+Generated files start with a banner comment recording the source file and
+translation time, for example
+`# Translated from fixtures\xseq.r by xr2p.py on 2026-07-12 10:00:56.`
+Suppress it with:
+
+```bat
+python xr2p.py fixtures\xseq.r --no-banner
+```
+
 ## Useful command-line options
 
 Show nonblank, noncomment lines of code for R and Python:
@@ -200,7 +209,14 @@ Support is partial, but the current translator covers a broad base-R subset:
 - R 1-based indexing, logical indexing, negative indexing, and matrix
   coordinate indexing.
 - `for`, `while`, `repeat`, `break`, and `next`.
+- `if`/`else` as expressions, including one-line forms with assignments in both
+  branches.
 - Functions, defaults, partial argument matching, `...`, and `do.call`.
+- Inline anonymous functions (`function(x) ...` and the R 4.1 `\(x)`
+  shorthand) in call arguments such as `sapply`, `apply`, and `outer`,
+  including `FUN =` keyword form and the backtick `` `[` `` extractor.
+- Native `|>` and magrittr-style `%>%` pipes.
+- `%%`, `%/%`, and `L`-suffixed integer literals.
 - Lists, `$`, `[[ ]]`, `lapply`, `sapply`, `mapply`, `split`, `unsplit`, and
   `Reduce`.
 - Matrices and arrays with R column-major ordering.
@@ -214,13 +230,14 @@ Support is partial, but the current translator covers a broad base-R subset:
 - Missing/infinite values: `NA`, typed `NA_*` constants, `NaN`, `Inf`,
   `is.na`, `is.nan`, `is.finite`, `is.infinite`, and `complete.cases`.
 - Strings and regex helpers including `paste`, `paste0`, `sprintf`, `substr`,
-  `grep`, `grepl`, `sub`, `gsub`, and `regexpr`.
+  `substr<-`, `strsplit`, `format`, `grep`, `grepl`, `sub`, `gsub`, and
+  `regexpr`.
 - Dates, date sequences, date formatting, and simple time series helpers.
 - Random generators and distribution `d`, `p`, and `q` functions using
   NumPy/SciPy where appropriate.
 - Basic modeling/statistics helpers including `lm`, `glm` binomial, `aov`,
   `model.matrix`, `prcomp`, `kmeans`, `arima`, `cor`, `cov`, `eigen`, `svd`,
-  `qr`, `polyroot`, `uniroot`, and `integrate`.
+  `qr`, `polyroot`, `uniroot`, `integrate`, `kruskal.test`, and `wilcox.test`.
 - File I/O helpers for CSV, tables, lines, simple text connections, and
   pickle-backed RDS-like save/load.
 - Minimal S3-style class, attributes, `UseMethod`, `try`, `tryCatch`, `stop`,

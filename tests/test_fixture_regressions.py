@@ -27,6 +27,8 @@ COMPILE_FIXTURES = [
     "xkalman_filter.r",
     "xem_mix_normals.r",
     "xtibble.r",
+    "xinline_lambda.r",
+    "xmisc_ops.r",
 ]
 
 
@@ -41,6 +43,8 @@ RUN_FIXTURES = [
     "xnames_preserved.r",
     "xregex.r",
     "xstop_warning.r",
+    "xinline_lambda.r",
+    "xmisc_ops.r",
 ]
 
 
