@@ -387,12 +387,6 @@ the output.
 When generated files contain too much boilerplate, use `--lean` or
 `--runtime-module --prune-runtime` to separate or reduce the runtime helpers.
 
-When adding support for a new R construct, prefer adding:
-
-- A small fixture script, usually named `xfeature_name.r`.
-- A compile or runtime regression test in `tests/`.
-- A focused helper function when Python/NumPy semantics differ from R.
-
 ## Limitations
 
 Known limitations include:
