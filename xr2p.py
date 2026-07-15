@@ -361,9 +361,12 @@ def preprocess_simple_inline_r(source: str) -> str:
       if (n == 1) return(0)
       for (i in 1:n) s = s + x[i]
     """
+    source = strip_r_console_transcript(source)
     out: list[str] = []
     pending_closes: list[str] = []
-    for raw in normalize_source_indentation(join_r_continuation_lines(source)):
+    joined_source = "\n".join(join_r_continuation_lines(source))
+    cleaned_source = strip_embedded_r_output(joined_source)
+    for raw in normalize_source_indentation(cleaned_source.splitlines()):
         for expanded in expand_chained_assignment(raw):
             expanded_lines = [
                 braced
@@ -381,6 +384,36 @@ def preprocess_simple_inline_r(source: str) -> str:
                 if is_open_control_line(line) and not stripped.endswith("{"):
                     pending_closes.append("}")
     out.extend(pending_closes)
+    return "\n".join(out) + ("\n" if source.endswith("\n") else "")
+
+
+def strip_r_console_transcript(source: str) -> str:
+    """Keep prompted commands and discard copied console output after the first prompt."""
+    out: list[str] = []
+    in_transcript = False
+    for raw in source.splitlines():
+        match = re.match(r"^(\s*)[>+]\s?(.*)$", raw)
+        if match is not None:
+            in_transcript = True
+            out.append(match.group(1) + match.group(2))
+        elif not in_transcript or not raw.strip() or raw.lstrip().startswith("#"):
+            out.append(raw)
+    return "\n".join(out) + ("\n" if source.endswith("\n") else "")
+
+
+def strip_embedded_r_output(source: str) -> str:
+    """Discard common printed table/vector rows pasted into Rosetta R listings."""
+    out: list[str] = []
+    for raw in source.splitlines():
+        stripped = raw.strip()
+        printed_vector = re.match(r"^\[\d+\]\s+", stripped) is not None
+        printed_name = re.match(r"^\.\`[^`]+\`$", stripped) is not None
+        tabular_row = (
+            re.search(r"\S\s{2,}\S", raw) is not None
+            and not any(token in stripped for token in ("<-", "=", "(", ")", "{", "}"))
+        )
+        if not printed_vector and not printed_name and stripped != "not" and not tabular_row:
+            out.append(raw)
     return "\n".join(out) + ("\n" if source.endswith("\n") else "")
 
 
@@ -494,7 +527,8 @@ def join_r_continuation_lines(source: str) -> list[str]:
         if not raw.lstrip().startswith("#"):
             raw = strip_r_comment(raw)
         if buffer:
-            buffer = buffer.rstrip() + " " + raw.strip()
+            separator = "\\n" if has_unclosed_quote(buffer) else " "
+            buffer = buffer.rstrip() + separator + raw.strip()
         else:
             buffer = raw
         if r_line_continues(buffer):
@@ -521,6 +555,8 @@ def r_line_continues(line: str) -> bool:
     stripped = strip_r_comment(line).rstrip()
     if not stripped:
         return False
+    if has_unclosed_quote(stripped):
+        return True
     if stripped.endswith(("{", "}", ";")):
         return False
     if has_unbalanced_delimiters(stripped):
@@ -534,6 +570,24 @@ def r_line_continues(line: str) -> bool:
     if stripped.endswith(")") and is_brace_less_function_header(stripped):
         return True
     return bool(re.search(r"(%[^%\s]+%|\|>|\+|-|\*|/|\||&|,)\s*$", stripped))
+
+
+def has_unclosed_quote(text: str) -> bool:
+    quote = ""
+    escaped = False
+    for ch in text:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in {'"', "'"}:
+            quote = ch
+    return bool(quote)
 
 
 def is_brace_less_function_header(stripped: str) -> bool:
@@ -4681,33 +4735,33 @@ def translate_statement_inner(line: str) -> list[str]:
     if parsed_else_if is not None:
         cond, rest = parsed_else_if
         if not rest:
-            return [f"elif {translate_expr(cond)}:"]
+            return [f"elif {translate_condition_expr(cond)}:"]
         split = split_top_level_else(rest)
         if split is not None:
             yes, no = split
             return [
-                f"elif {translate_expr(cond)}:",
+                f"elif {translate_condition_expr(cond)}:",
                 *[INDENT + part for part in translate_statement(yes)],
                 "else:",
                 *[INDENT + part for part in translate_statement(no)],
             ]
-        return [f"elif {translate_expr(cond)}:", *[INDENT + part for part in translate_statement(rest)]]
+        return [f"elif {translate_condition_expr(cond)}:", *[INDENT + part for part in translate_statement(rest)]]
 
     parsed_if = parse_if_line(line)
     if parsed_if is not None:
         cond, rest = parsed_if
         if not rest:
-            return [f"if {translate_expr(cond)}:"]
+            return [f"if {translate_condition_expr(cond)}:"]
         split = split_top_level_else(rest)
         if split is not None:
             yes, no = split
             return [
-                f"if {translate_expr(cond)}:",
+                f"if {translate_condition_expr(cond)}:",
                 *[INDENT + part for part in translate_statement(yes)],
                 "else:",
                 *[INDENT + part for part in translate_statement(no)],
             ]
-        return [f"if {translate_expr(cond)}:", *[INDENT + part for part in translate_statement(rest)]]
+        return [f"if {translate_condition_expr(cond)}:", *[INDENT + part for part in translate_statement(rest)]]
 
     parsed_for = parse_for_line(line)
     if parsed_for is not None:
@@ -4864,6 +4918,11 @@ def translate_statement_inner(line: str) -> list[str]:
             if len(parts) == 3:
                 target = translate_expr(parts[0])
                 return [f"{target} = r_substr_assign({target}, {translate_expr(parts[1])}, {translate_expr(parts[2])}, {translate_expr(raw_rhs)})"]
+        if repl_call is not None:
+            parts = split_args(repl_call.group(2))
+            setter = r_function_name(repl_call.group(1)) + "_replace"
+            call_args = [translate_expr(part) for part in parts] + [translate_expr(raw_rhs)]
+            return [f"{setter}({', '.join(call_args)})"]
         raw_double_subscript_assign = re.match(r"^([A-Za-z]\w*)\[\[(.*)\]\]$", raw_lhs)
         if raw_double_subscript_assign:
             base, index = raw_double_subscript_assign.groups()
@@ -5179,6 +5238,14 @@ def parse_if_line(line: str) -> tuple[str, str] | None:
     if close < 0:
         return None
     return line[pos + 1 : close].strip(), line[close + 1 :].strip()
+
+
+def translate_condition_expr(expr: str) -> str:
+    """Allow R assignment expressions in conditions without affecting normal assignments."""
+    has_assignment = "<-" in expr
+    translated = translate_expr(expr.replace("<-", " __R_WALRUS__ "))
+    translated = translated.replace("__R_WALRUS__", ":=")
+    return f"({translated})" if has_assignment else translated
 
 
 def parse_else_if_line(line: str) -> tuple[str, str] | None:
@@ -5515,6 +5582,19 @@ def mask_inline_if_call_arguments(expr: str) -> str:
 
 def translate_expr(expr: str) -> str:
     expr = expr.strip().rstrip(";")
+    bare_functions = {
+        "as.character": "(lambda x: np.asarray(x, dtype=str))",
+        "as.name": "str",
+    }
+    if expr in bare_functions:
+        return mask_lambda(bare_functions[expr])
+    invoked_function = re.match(r"^\(\s*function\s*\((.*?)\)\s+(.+)\)\s*\((.*)\)$", expr, re.DOTALL)
+    if invoked_function is not None:
+        params, body, call_args = invoked_function.groups()
+        body_expr = translate_if_else_expr(body) or translate_expr(body)
+        py_params = ", ".join(r_name(part.strip()) for part in split_args(params) if part.strip())
+        py_args = ", ".join(translate_expr(part) for part in split_args(call_args))
+        return f"(lambda {py_params}: {body_expr})({py_args})"
     backtick_op = re.fullmatch(r"`([^`\w]+)`", expr)
     if backtick_op:
         return repr(backtick_op.group(1))
@@ -6253,6 +6333,8 @@ def translate_subscript(index: str, *, base: str | None = None) -> str:
         return index
     if index.startswith("np.arange(") and index.endswith(")"):
         return f"({index}) - 1"
+    if "$" in index:
+        index = translate_expr(index)
     return f"({index}) - 1"
 
 
@@ -7383,7 +7465,13 @@ def translate_c_call(args: list[str]) -> str:
     for arg in args:
         pos = find_top_level_operator(arg, "=")
         if pos >= 0:
-            names.append(arg[:pos].strip())
+            raw_name = arg[:pos].strip()
+            masked_name = masked_string_text(raw_name)
+            if masked_name is not None and is_string_literal(masked_name):
+                raw_name = masked_name[1:-1]
+            elif is_string_literal(raw_name):
+                raw_name = raw_name[1:-1]
+            names.append(raw_name)
             values.append(translate_expr(arg[pos + 1 :].strip()))
         else:
             names.append(None)
@@ -7499,6 +7587,11 @@ def translate_data_frame_call(args: list[str]) -> str:
         pos = find_top_level_operator(arg, "=")
         if pos >= 0:
             raw_name = arg[:pos].strip()
+            masked_name = masked_string_text(raw_name)
+            if masked_name is not None and is_string_literal(masked_name):
+                raw_name = masked_name[1:-1]
+            elif is_string_literal(raw_name):
+                raw_name = raw_name[1:-1]
             if "." in raw_name:
                 DOTTED_R_VARS.add(raw_name)
             name = r_name(raw_name)
@@ -7839,6 +7932,9 @@ def translate_scoped_expr(expr: str, env_name: str) -> str:
         name = match.group(1)
         if name in reserved or name.startswith("_"):
             return name
+        tail = translated[match.end() :].lstrip()
+        if tail.startswith(("(", "=")):
+            return name
         return f"{env_name}[{name!r}]"
 
     return re.sub(r"(?<![\w.'\"])([A-Za-z_]\w*)\b", repl, translated)
@@ -8046,7 +8142,7 @@ def translate_list_call(args: list[str]) -> str:
 
 def translate_vector_call(args: list[str]) -> str:
     if not args:
-        raise R2PyError("vector requires a mode")
+        return "np.array([], dtype=bool)"
     mode = args[0].strip().strip("\"'")
     length = translate_expr(args[1] if len(args) > 1 and "=" not in args[1] else keyword_arg(args, "length", default="0"))
     if mode == "list":
@@ -8207,8 +8303,11 @@ def translate_format_call(args: list[str]) -> str:
 def translate_matrix_call(args: list[str]) -> str:
     if not args:
         raise R2PyError("matrix requires at least one argument")
-    data = translate_expr(args[0])
     positional = positional_args(args)
+    data_arg = keyword_arg(args, "data", default=positional[0] if positional else None)
+    if data_arg is None:
+        raise R2PyError("matrix requires data")
+    data = translate_expr(data_arg)
     nrow = keyword_arg(args, "nrow", default=positional[1] if len(positional) >= 2 else None)
     ncol = keyword_arg(args, "ncol", default=positional[2] if len(positional) >= 3 else None)
     byrow = translate_expr(keyword_arg(args, "byrow", default="False"))
